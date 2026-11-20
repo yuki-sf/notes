@@ -6,15 +6,17 @@
     <meta name="author" content="Hizkia Felix - hizkifw.me" />
     <meta
       name="description"
-      content="Dark theme notes with live markdown, saves to your browser storage"
+      content="Dark theme Notion-like notes with live markdown and multi-page storage"
     />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <script>
-      var lskeyDoc = 'doc';
-      var lskeyTime = 'doc-lastsave';
+      var LS_PAGES = 'notes-pages-v1';
+      var LS_ACTIVE = 'notes-active-v1';
+      var LS_TIME = 'notes-lastsave-v1';
+      var LS_LEGACY_DOC = 'doc';
 
       /* ------------------------------------------------------------------
-       * Tiny markdown renderer (no dependencies, works offline)
+       * Markdown Inline & Block Renderer
        * ------------------------------------------------------------------ */
 
       var PALETTE = {
@@ -134,11 +136,6 @@
       var RE_QUOTE = /^\s{0,3}>\s?(.*)$/;
       var RE_LI = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
 
-      /* ------------------------------------------------------------------
-       * Live Notion-style Block Parsing & Rendering
-       * ------------------------------------------------------------------ */
-
-      // Splits raw markdown into logical blocks (single lines or fenced code blocks)
       function parseBlocks(text) {
         var lines = text.replace(/\r\n?/g, '\n').split('\n');
         var blocks = [];
@@ -166,7 +163,6 @@
         return blocks;
       }
 
-      // Renders a single block into its Notion-style visual HTML when not actively focused
       function renderSingleBlock(block) {
         var raw = block.raw;
 
@@ -187,7 +183,13 @@
         if ((m = raw.match(RE_HEAD))) {
           var lvl = m[1].length;
           return (
-            '<h' + lvl + '>' + (inline(m[2].replace(/\s+#+\s*$/, '')) || '&nbsp;') + '</h' + lvl + '>'
+            '<h' +
+            lvl +
+            '>' +
+            (inline(m[2].replace(/\s+#+\s*$/, '')) || '&nbsp;') +
+            '</h' +
+            lvl +
+            '>'
           );
         }
 
@@ -204,22 +206,38 @@
           var pad = Math.floor(indent / 2) * 1.4;
           var marker = m[2];
           var content = m[3];
-          var task = content.match(/^\[( \vert{}x\vert{}X)\](?:\s+(.*))?$/);
+          var task = content.match(/^\[( |x|X)\](?:\s+(.*))?$/);
 
           if (task) {
             var done = task[1] !== ' ';
             return (
-              '<div class="md-li task' + (done ? ' done' : '') + '" style="padding-left:' + (1.6 + pad) + 'rem">' +
-              '<input type="checkbox" data-line="' + block.startLine + '"' + (done ? ' checked' : '') + '>' +
-              '<span>' + (inline(task[2] || '') || '&nbsp;') + '</span></div>'
+              '<div class="md-li task' +
+              (done ? ' done' : '') +
+              '" style="padding-left:' +
+              (1.6 + pad) +
+              'rem">' +
+              '<input type="checkbox" data-line="' +
+              block.startLine +
+              '"' +
+              (done ? ' checked' : '') +
+              '>' +
+              '<span>' +
+              (inline(task[2] || '') || '&nbsp;') +
+              '</span></div>'
             );
           }
 
           var bullet = /\d/.test(marker) ? marker : '•';
           return (
-            '<div class="md-li" style="padding-left:' + (1.6 + pad) + 'rem">' +
-            '<span class="md-bullet">' + esc(bullet) + '</span>' +
-            '<span>' + (inline(content) || '&nbsp;') + '</span></div>'
+            '<div class="md-li" style="padding-left:' +
+            (1.6 + pad) +
+            'rem">' +
+            '<span class="md-bullet">' +
+            esc(bullet) +
+            '</span>' +
+            '<span>' +
+            (inline(content) || '&nbsp;') +
+            '</span></div>'
           );
         }
 
@@ -227,32 +245,249 @@
       }
 
       /* ------------------------------------------------------------------
+       * Slash / Markdown Command Menu Definitions
+       * ------------------------------------------------------------------ */
+
+      var COMMANDS = [
+        { id: 'h1', label: 'Heading 1', syntax: '# ', desc: 'Large section heading', icon: 'H1' },
+        { id: 'h2', label: 'Heading 2', syntax: '## ', desc: 'Medium section heading', icon: 'H2' },
+        { id: 'h3', label: 'Heading 3', syntax: '### ', desc: 'Small section heading', icon: 'H3' },
+        { id: 'todo', label: 'To-do list', syntax: '- [ ] ', desc: 'Track tasks with a checkbox', icon: '☑' },
+        { id: 'bullet', label: 'Bulleted list', syntax: '- ', desc: 'Create a simple bulleted list', icon: '•' },
+        { id: 'number', label: 'Numbered list', syntax: '1. ', desc: 'Create a list with numbering', icon: '1.' },
+        { id: 'quote', label: 'Quote', syntax: '> ', desc: 'Capture a quote or callout', icon: '”' },
+        { id: 'code', label: 'Code block', syntax: '```\n\n```', desc: 'Capture a code snippet', icon: '</>' },
+        { id: 'divider', label: 'Divider', syntax: '---', desc: 'Visually divide blocks', icon: '—' },
+      ];
+
+      /* ------------------------------------------------------------------
        * App
        * ------------------------------------------------------------------ */
 
       function init() {
-        if (!('localStorage' in window)) {
-          alert('Your browser does not support localStorage. Notes will not be saved.');
-        }
-
         var editor = document.getElementById('editor');
+        var pageTitleEl = document.getElementById('pageTitle');
+        var pageListEl = document.getElementById('pageList');
         var help = document.getElementById('help');
+        var cmdMenu = document.getElementById('cmdMenu');
+        var sidebar = document.getElementById('sidebar');
 
-        var rawText = localStorage.getItem(lskeyDoc) || '';
-        var lastSave = Number(localStorage.getItem(lskeyTime)) || Date.now();
+        var pages = [];
+        var activePageId = null;
+        var lastSave = Number(localStorage.getItem(LS_TIME)) || Date.now();
         var activeIdx = -1;
 
-        function save() {
+        // Command palette state
+        var cmdOpen = false;
+        var cmdMatches = [];
+        var cmdSelected = 0;
+        var cmdTriggerChar = '/';
+
+        function uid() {
+          return 'p_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        }
+
+        function loadState() {
+          try {
+            var stored = JSON.parse(localStorage.getItem(LS_PAGES));
+            if (Array.isArray(stored) && stored.length > 0) {
+              pages = stored;
+            } else {
+              var legacy = localStorage.getItem(LS_LEGACY_DOC) || '';
+              pages = [
+                {
+                  id: uid(),
+                  title: 'Getting Started',
+                  content: legacy,
+                },
+              ];
+            }
+          } catch (e) {
+            pages = [{ id: uid(), title: 'Untitled', content: '' }];
+          }
+
+          var savedActive = localStorage.getItem(LS_ACTIVE);
+          activePageId = pages.some(function (p) {
+            return p.id === savedActive;
+          })
+            ? savedActive
+            : pages[0].id;
+        }
+
+        function currentPage() {
+          return (
+            pages.find(function (p) {
+              return p.id === activePageId;
+            }) || pages[0]
+          );
+        }
+
+        function saveState() {
           lastSave = Date.now();
           try {
-            localStorage.setItem(lskeyDoc, rawText);
-            localStorage.setItem(lskeyTime, lastSave);
+            localStorage.setItem(LS_PAGES, JSON.stringify(pages));
+            localStorage.setItem(LS_ACTIVE, activePageId);
+            localStorage.setItem(LS_TIME, lastSave);
           } catch (e) {
             console.error(e);
           }
         }
 
-        // Convert plain text safely into DOM nodes with <br> for newlines
+        /* --- Sidebar & Multi-page Management --- */
+
+        function renderSidebar() {
+          pageListEl.innerHTML = '';
+          pages.forEach(function (page) {
+            var item = document.createElement('div');
+            item.className = 'page-item' + (page.id === activePageId ? ' active' : '');
+
+            var nameSpan = document.createElement('span');
+            nameSpan.className = 'page-name';
+            nameSpan.textContent = page.title.trim() || 'Untitled';
+            nameSpan.title = 'Click to open • Double-click to rename';
+
+            nameSpan.addEventListener('click', function () {
+              if (page.id !== activePageId) {
+                switchPage(page.id);
+              }
+            });
+
+            nameSpan.addEventListener('dblclick', function (e) {
+              e.stopPropagation();
+              startInlineRename(page, item, nameSpan);
+            });
+
+            var actions = document.createElement('div');
+            actions.className = 'page-actions';
+
+            var renameBtn = document.createElement('button');
+            renameBtn.type = 'button';
+            renameBtn.className = 'icon-btn';
+            renameBtn.title = 'Rename page';
+            renameBtn.innerHTML = '✎';
+            renameBtn.addEventListener('click', function (e) {
+              e.stopPropagation();
+              startInlineRename(page, item, nameSpan);
+            });
+
+            actions.appendChild(renameBtn);
+
+            if (pages.length > 1) {
+              var delBtn = document.createElement('button');
+              delBtn.type = 'button';
+              delBtn.className = 'icon-btn del';
+              delBtn.title = 'Delete page';
+              delBtn.innerHTML = '×';
+              delBtn.addEventListener('click', function (e) {
+                e.stopPropagation();
+                deletePage(page.id);
+              });
+              actions.appendChild(delBtn);
+            }
+
+            item.appendChild(nameSpan);
+            item.appendChild(actions);
+            pageListEl.appendChild(item);
+          });
+        }
+
+        function startInlineRename(page, itemEl, nameSpan) {
+          var input = document.createElement('input');
+          input.type = 'text';
+          input.className = 'rename-input';
+          input.value = page.title;
+          itemEl.replaceChild(input, nameSpan);
+          input.focus();
+          input.select();
+
+          function commit() {
+            page.title = input.value.trim() || 'Untitled';
+            if (page.id === activePageId) {
+              pageTitleEl.value = page.title;
+            }
+            saveState();
+            renderSidebar();
+          }
+
+          input.addEventListener('blur', commit);
+          input.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              input.blur();
+            } else if (e.key === 'Escape') {
+              renderSidebar();
+            }
+          });
+        }
+
+        function switchPage(id) {
+          if (activeIdx >= 0) syncFromDOM();
+          closeCmdMenu();
+          activePageId = id;
+          var page = currentPage();
+          pageTitleEl.value = page.title;
+          saveState();
+          renderSidebar();
+          renderAll(page.content ? -1 : 0, 0);
+        }
+
+        function addPage() {
+          if (activeIdx >= 0) syncFromDOM();
+          closeCmdMenu();
+          var newPage = {
+            id: uid(),
+            title: 'Untitled',
+            content: '',
+          };
+          pages.push(newPage);
+          activePageId = newPage.id;
+          pageTitleEl.value = newPage.title;
+          saveState();
+          renderSidebar();
+          renderAll(-1);
+          pageTitleEl.focus();
+          pageTitleEl.select();
+        }
+
+        function deletePage(id) {
+          if (pages.length <= 1) return;
+          var idx = pages.findIndex(function (p) {
+            return p.id === id;
+          });
+          if (idx < 0) return;
+          pages.splice(idx, 1);
+          if (activePageId === id) {
+            var nextPage = pages[Math.max(0, idx - 1)];
+            activePageId = nextPage.id;
+            pageTitleEl.value = nextPage.title;
+            renderAll(-1);
+          }
+          saveState();
+          renderSidebar();
+        }
+
+        pageTitleEl.addEventListener('input', function () {
+          var page = currentPage();
+          page.title = pageTitleEl.value;
+          saveState();
+          renderSidebar();
+        });
+
+        pageTitleEl.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            editor.focus();
+            renderAll(0, 0);
+          }
+        });
+
+        document.getElementById('newPageBtn').addEventListener('click', addPage);
+        document.getElementById('sidebarToggle').addEventListener('click', function () {
+          sidebar.classList.toggle('collapsed');
+        });
+
+        /* --- DOM Text & Caret Helpers --- */
+
         function setPlainText(el, text) {
           el.innerHTML = '';
           if (!text) {
@@ -266,7 +501,6 @@
           });
         }
 
-        // Extract plain text back from a contenteditable block
         function getPlainText(el) {
           var text = '';
           el.childNodes.forEach(function (node) {
@@ -278,11 +512,9 @@
               text += node.innerText || node.textContent || '';
             }
           });
-          // Remove trailing browser placeholder <br>
           return text.replace(/\n$/, '');
         }
 
-        // Get caret character offset inside an element
         function getCaretOffset(el) {
           var sel = window.getSelection();
           if (!sel.rangeCount) return 0;
@@ -295,7 +527,6 @@
           return getPlainText(div).length;
         }
 
-        // Restore caret character offset inside an element
         function setCaretOffset(el, offset) {
           var sel = window.getSelection();
           var range = document.createRange();
@@ -346,11 +577,12 @@
               lines.push(el.dataset.raw);
             }
           });
-          rawText = lines.join('\n');
-          save();
+          currentPage().content = lines.join('\n');
+          saveState();
         }
 
         function renderAll(focusIdx, caretPos) {
+          var rawText = currentPage().content;
           var blocks = parseBlocks(rawText);
           if (blocks.length === 0) blocks = [{ raw: '', startLine: 0, isFence: false }];
           activeIdx = focusIdx;
@@ -397,29 +629,167 @@
           renderAll(idx, caretPos);
         }
 
-        // Initial render
-        renderAll(rawText ? -1 : 0, 0);
+        /* --- Notion-like Command Popup Menu --- */
 
-        // Clicking a block activates raw markdown editing for just that block
+        function closeCmdMenu() {
+          cmdOpen = false;
+          cmdMenu.hidden = true;
+        }
+
+        function renderCmdMenu() {
+          cmdMenu.innerHTML = '<div class="cmd-header">BASIC BLOCKS</div>';
+          cmdMatches.forEach(function (cmd, idx) {
+            var row = document.createElement('div');
+            row.className = 'cmd-item' + (idx === cmdSelected ? ' selected' : '');
+            row.innerHTML =
+              '<span class="cmd-icon">' +
+              esc(cmd.icon) +
+              '</span>' +
+              '<div class="cmd-meta">' +
+              '<div class="cmd-title">' +
+              esc(cmd.label) +
+              '</div>' +
+              '<div class="cmd-desc">' +
+              esc(cmd.desc) +
+              '</div>' +
+              '</div>' +
+              '<span class="cmd-hint">' +
+              esc(cmd.syntax.split('\n')[0].trim()) +
+              '</span>';
+
+            row.addEventListener('mousedown', function (e) {
+              e.preventDefault();
+              applyCommand(cmd);
+            });
+            row.addEventListener('mouseenter', function () {
+              cmdSelected = idx;
+              updateCmdSelection();
+            });
+            cmdMenu.appendChild(row);
+          });
+        }
+
+        function updateCmdSelection() {
+          var items = cmdMenu.querySelectorAll('.cmd-item');
+          items.forEach(function (el, idx) {
+            el.classList.toggle('selected', idx === cmdSelected);
+          });
+        }
+
+        function positionCmdMenu(blockEl) {
+          var rect = blockEl.getBoundingClientRect();
+          var top = rect.bottom + 6;
+          if (top + 290 > window.innerHeight) {
+            top = Math.max(12, rect.top - 290);
+          }
+          cmdMenu.style.top = top + 'px';
+          cmdMenu.style.left = Math.max(16, rect.left) + 'px';
+        }
+
+        function checkCommandTrigger() {
+          if (activeIdx < 0 || !editor.children[activeIdx]) {
+            closeCmdMenu();
+            return;
+          }
+          var el = editor.children[activeIdx];
+          var text = getPlainText(el);
+
+          // Trigger on "/" with optional filter text, e.g., "/h1" or "/todo"
+          var slashMatch = text.match(/^\/([a-zA-Z0-9]*)$/);
+          if (slashMatch) {
+            var query = slashMatch[1].toLowerCase();
+            cmdMatches = COMMANDS.filter(function (c) {
+              return (
+                c.label.toLowerCase().indexOf(query) >= 0 ||
+                c.id.indexOf(query) >= 0 ||
+                c.syntax.trim().indexOf(query) >= 0
+              );
+            });
+            if (cmdMatches.length > 0) {
+              cmdOpen = true;
+              cmdSelected = 0;
+              cmdMenu.hidden = false;
+              renderCmdMenu();
+              positionCmdMenu(el);
+              return;
+            }
+          }
+
+          // Also show a helpful command popup when user types "-" or ">" alone at line start
+          if (text === '-' || text === '>') {
+            cmdMatches = COMMANDS.filter(function (c) {
+              return text === '-'
+                ? c.id === 'bullet' || c.id === 'todo' || c.id === 'divider'
+                : c.id === 'quote';
+            });
+            cmdOpen = true;
+            cmdSelected = 0;
+            cmdMenu.hidden = false;
+            renderCmdMenu();
+            positionCmdMenu(el);
+            return;
+          }
+
+          closeCmdMenu();
+        }
+
+        function applyCommand(cmd) {
+          if (activeIdx < 0 || !editor.children[activeIdx]) return;
+          var el = editor.children[activeIdx];
+          closeCmdMenu();
+
+          if (cmd.id === 'code') {
+            el.dataset.raw = '```\n\n```';
+            syncFromDOM();
+            renderAll(activeIdx, 4);
+            return;
+          }
+
+          if (cmd.id === 'divider') {
+            el.dataset.raw = '---';
+            syncFromDOM();
+            var blocks = parseBlocks(currentPage().content);
+            var lines = currentPage().content.split('\n');
+            lines.splice(blocks[activeIdx].startLine + 1, 0, '');
+            currentPage().content = lines.join('\n');
+            saveState();
+            renderAll(activeIdx + 1, 0);
+            return;
+          }
+
+          setPlainText(el, cmd.syntax);
+          el.dataset.raw = cmd.syntax;
+          setCaretOffset(el, cmd.syntax.length);
+          syncFromDOM();
+        }
+
+        /* --- Editor Interactions & Keyboard Handling --- */
+
+        loadState();
+        pageTitleEl.value = currentPage().title;
+        renderSidebar();
+        renderAll(currentPage().content ? -1 : 0, 0);
+
         editor.addEventListener('mousedown', function (e) {
-          // Allow clicking links directly
           if (e.target.closest('a')) return;
 
-          // Handle interactive checkboxes without switching to raw mode
           if (e.target.matches('input[type="checkbox"][data-line]')) {
             e.preventDefault();
             var ln = Number(e.target.dataset.line);
-            var lines = rawText.split('\n');
+            var lines = currentPage().content.split('\n');
             if (lines[ln] != null) {
               lines[ln] = lines[ln].replace(
-                /^(\s*(?:[-*+]|\d+[.)])\s+)\[( \vert{}x\vert{}X)\]/,
+                /^(\s*(?:[-*+]|\d+[.)])\s+)\[( |x|X)\]/,
                 function (_, pre, c) {
                   return pre + (c === ' ' ? '[x]' : '[ ]');
                 }
               );
-              rawText = lines.join('\n');
-              save();
-              renderAll(activeIdx, activeIdx >= 0 ? getCaretOffset(editor.children[activeIdx]) : 0);
+              currentPage().content = lines.join('\n');
+              saveState();
+              renderAll(
+                activeIdx,
+                activeIdx >= 0 ? getCaretOffset(editor.children[activeIdx]) : 0
+              );
             }
             return;
           }
@@ -435,31 +805,32 @@
           }
         });
 
-        // Clicking empty space below the last block focuses/creates a block at the end
-        document.body.addEventListener('mousedown', function (e) {
-          if (e.target === document.body || e.target === editor) {
+        document.getElementById('mainCanvas').addEventListener('mousedown', function (e) {
+          if (e.target.id === 'mainCanvas' || e.target === editor) {
             e.preventDefault();
             editor.focus();
-            var blocks = parseBlocks(rawText);
+            var blocks = parseBlocks(currentPage().content);
             var lastIdx = blocks.length - 1;
             if (blocks[lastIdx].raw !== '') {
-              rawText += '\n';
+              currentPage().content += '\n';
+              saveState();
               lastIdx++;
             }
             renderAll(lastIdx, 0);
           }
         });
 
-        // Keep active block synchronized when navigating with arrow keys
         document.addEventListener('selectionchange', function () {
           if (document.activeElement !== editor) return;
           var sel = window.getSelection();
           if (!sel.rangeCount) return;
           var node = sel.anchorNode;
-          var blockEl = node.nodeType === 1 ? node.closest('.block') : node.parentElement.closest('.block');
+          var blockEl =
+            node.nodeType === 1 ? node.closest('.block') : node.parentElement.closest('.block');
           if (blockEl) {
             var idx = Number(blockEl.dataset.idx);
             if (idx !== activeIdx) {
+              closeCmdMenu();
               var offset = getCaretOffset(blockEl);
               syncFromDOM();
               renderAll(idx, offset);
@@ -467,28 +838,30 @@
           }
         });
 
-        // Blur renders the active block cleanly
         editor.addEventListener('blur', function () {
-          if (activeIdx >= 0) {
-            syncFromDOM();
-            renderAll(-1);
-          }
+          setTimeout(function () {
+            if (document.activeElement !== editor) {
+              closeCmdMenu();
+              if (activeIdx >= 0) {
+                syncFromDOM();
+                renderAll(-1);
+              }
+            }
+          }, 120);
         });
 
-        // Save on input
         editor.addEventListener('input', function () {
           if (activeIdx >= 0 && editor.children[activeIdx]) {
             editor.children[activeIdx].dataset.raw = getPlainText(editor.children[activeIdx]);
           }
           syncFromDOM();
+          checkCommandTrigger();
         });
 
-        // Paste plain text cleanly
         editor.addEventListener('paste', function (e) {
           e.preventDefault();
           var text = (e.clipboardData || window.clipboardData).getData('text/plain');
-          if (!text) return;
-          if (activeIdx < 0) return;
+          if (!text || activeIdx < 0) return;
 
           var el = editor.children[activeIdx];
           var cur = getPlainText(el);
@@ -497,15 +870,40 @@
           el.dataset.raw = updated;
           syncFromDOM();
 
-          var newBlocks = parseBlocks(rawText);
+          var newBlocks = parseBlocks(currentPage().content);
           var targetIdx = Math.min(activeIdx + text.split('\n').length - 1, newBlocks.length - 1);
           renderAll(targetIdx, newBlocks[targetIdx].raw.length);
         });
 
-        // Editor keyboard shortcuts: Enter, Backspace merge, Tab indent, Escape
-        var RE_LISTLINE = /^(\s*)(?:([-*+])|(\d{1,9})([.)]))\s+([[ xX]]\s+)?(.*)$/;
+        var RE_LISTLINE = /^(\s*)(?:([-*+])|(\d{1,9})([.)]))\s+(\[[ xX]\]\s+)?(.*)$/;
 
         editor.addEventListener('keydown', function (e) {
+          // Handle Command Menu keyboard navigation first
+          if (cmdOpen) {
+            if (e.key === 'ArrowDown') {
+              e.preventDefault();
+              cmdSelected = (cmdSelected + 1) % cmdMatches.length;
+              updateCmdSelection();
+              return;
+            }
+            if (e.key === 'ArrowUp') {
+              e.preventDefault();
+              cmdSelected = (cmdSelected - 1 + cmdMatches.length) % cmdMatches.length;
+              updateCmdSelection();
+              return;
+            }
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              applyCommand(cmdMatches[cmdSelected]);
+              return;
+            }
+            if (e.key === 'Escape') {
+              e.preventDefault();
+              closeCmdMenu();
+              return;
+            }
+          }
+
           if (e.key === 'Escape') {
             help.hidden = true;
             return;
@@ -538,7 +936,7 @@
             return;
           }
 
-          // Enter splits into a new block (unless inside an unclosed ``` fence or Shift+Enter)
+          // Enter: create new line/block cleanly
           if (e.key === 'Enter' && !e.isComposing) {
             var fenceLines = v.split('\n');
             var unclosedFence =
@@ -559,11 +957,12 @@
             var before = v.slice(0, offset);
             var after = v.slice(offset);
 
-            // Auto-continue lists
+            // Auto-continue lists on Enter
             var m = before.match(RE_LISTLINE);
             if (m && after === '') {
               if (m[6] === '') {
                 // Empty list item: Enter exits the list
+                setPlainText(el, '');
                 el.dataset.raw = '';
                 syncFromDOM();
                 renderAll(activeIdx, 0);
@@ -574,18 +973,26 @@
               el.dataset.raw = before;
               syncFromDOM();
 
-              var lines = rawText.split('\n');
-              var blocks = parseBlocks(rawText);
-              var insertLine = blocks[activeIdx].startLine + blocks[activeIdx].raw.split('\n').length;
+              var blocks = parseBlocks(currentPage().content);
+              var lines = currentPage().content.split('\n');
+              var insertLine =
+                blocks[activeIdx].startLine + blocks[activeIdx].raw.split('\n').length;
               lines.splice(insertLine, 0, prefix);
-              rawText = lines.join('\n');
-              save();
+              currentPage().content = lines.join('\n');
+              saveState();
               renderAll(activeIdx + 1, prefix.length);
               return;
             }
 
-            el.dataset.raw = before + '\n' + after;
-            syncFromDOM();
+            // Standard Enter split: insert newline into raw data and render next block focused
+            var blocks = parseBlocks(currentPage().content);
+            var lines = currentPage().content.split('\n');
+            var curBlock = blocks[activeIdx];
+            var blockLineCount = curBlock.raw.split('\n').length;
+
+            lines.splice(curBlock.startLine, blockLineCount, before, after);
+            currentPage().content = lines.join('\n');
+            saveState();
             renderAll(activeIdx + 1, 0);
             return;
           }
@@ -595,26 +1002,32 @@
             var sel = window.getSelection();
             if (sel.isCollapsed) {
               e.preventDefault();
-              var blocks = parseBlocks(rawText);
+              var blocks = parseBlocks(currentPage().content);
               var prevRaw = blocks[activeIdx - 1].raw;
               var curRaw = v;
               var joinPos = prevRaw.length;
 
               blocks[activeIdx - 1].raw = prevRaw + curRaw;
               blocks.splice(activeIdx, 1);
-              rawText = blocks.map(function (b) { return b.raw; }).join('\n');
-              save();
+              currentPage().content = blocks
+                .map(function (b) {
+                  return b.raw;
+                })
+                .join('\n');
+              saveState();
               renderAll(activeIdx - 1, joinPos);
             }
           }
         });
 
-        // Cross-tab sync
+        // Cross-tab synchronization
         function reloadDoc() {
-          var lsTime = Number(localStorage.getItem(lskeyTime));
+          var lsTime = Number(localStorage.getItem(LS_TIME));
           if (lsTime > lastSave) {
             lastSave = lsTime;
-            rawText = localStorage.getItem(lskeyDoc) || '';
+            loadState();
+            pageTitleEl.value = currentPage().title;
+            renderSidebar();
             renderAll(-1);
           }
         }
@@ -627,10 +1040,12 @@
         });
 
         document.addEventListener('keydown', function (e) {
-          if (e.key === 'Escape') help.hidden = true;
+          if (e.key === 'Escape') {
+            help.hidden = true;
+            closeCmdMenu();
+          }
         });
 
-        // Register service worker for offline usage
         if ('serviceWorker' in navigator) {
           navigator.serviceWorker.register('./sw.js').catch(function (e) {
             console.error(e);
@@ -641,12 +1056,14 @@
     <style>
       :root {
         color-scheme: dark;
-        --bg: #111;
-        --fg: #fff;
+        --bg: #111111;
+        --sidebar-bg: #161616;
+        --fg: #ffffff;
         --text: #e6e6e6;
-        --dim: #737373;
+        --dim: #7a7a7a;
         --line: #262626;
-        --raise: #1a1a1a;
+        --raise: #1d1d1d;
+        --hover: #222222;
         --accent: #74c0fc;
         --font-edit: Menlo, Consolas, Monaco, Liberation Mono, Lucida Console, monospace;
         --font-view: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
@@ -665,25 +1082,227 @@
         background-color: var(--bg);
         color: var(--text);
         font-family: var(--font-view);
-        overflow-y: auto;
+        overflow: hidden;
       }
 
-      /* Centered Notion-like canvas */
-      #editor {
+      .app-shell {
+        display: flex;
+        width: 100%;
+        height: 100%;
+      }
+
+      /* Notion-style Left Sidebar */
+      #sidebar {
+        width: 240px;
+        flex-shrink: 0;
+        background: var(--sidebar-bg);
+        border-right: 1px solid var(--line);
+        display: flex;
+        flex-direction: column;
+        transition: width 0.18s ease, opacity 0.15s ease;
+        user-select: none;
+      }
+
+      #sidebar.collapsed {
+        width: 0;
+        overflow: hidden;
+        border-right: 0;
+      }
+
+      .sidebar-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.9rem 0.85rem;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 0.55rem;
+        font-weight: 600;
+        font-size: 0.92rem;
+        color: var(--fg);
+      }
+
+      .brand img {
+        width: 22px;
+        height: 22px;
+        border-radius: 4px;
+        object-fit: cover;
+        background: var(--raise);
+      }
+
+      .sidebar-section-label {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.85rem 0.85rem 0.35rem;
+        font-size: 0.72rem;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        color: var(--dim);
+      }
+
+      #newPageBtn {
+        background: transparent;
+        border: 0;
+        color: var(--dim);
+        font-size: 1.1rem;
+        line-height: 1;
+        padding: 0.15rem 0.35rem;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      #newPageBtn:hover {
+        background: var(--hover);
+        color: var(--fg);
+      }
+
+      #pageList {
+        flex: 1;
+        overflow-y: auto;
+        padding: 0.25rem 0.5rem;
+      }
+
+      .page-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.42rem 0.55rem;
+        border-radius: 5px;
+        font-size: 0.88rem;
+        color: #b5b5b5;
+        cursor: pointer;
+        margin-bottom: 2px;
+      }
+
+      .page-item:hover {
+        background: var(--hover);
+        color: var(--fg);
+      }
+
+      .page-item.active {
+        background: #242424;
+        color: var(--fg);
+        font-weight: 500;
+      }
+
+      .page-name {
+        flex: 1;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .page-name::before {
+        content: '📄 ';
+        font-size: 0.8rem;
+        opacity: 0.7;
+      }
+
+      .page-actions {
+        display: flex;
+        gap: 2px;
+        opacity: 0;
+        transition: opacity 0.12s;
+      }
+
+      .page-item:hover .page-actions {
+        opacity: 1;
+      }
+
+      .icon-btn {
+        background: transparent;
+        border: 0;
+        color: var(--dim);
+        font-size: 0.82rem;
+        padding: 0.1rem 0.3rem;
+        border-radius: 3px;
+        cursor: pointer;
+      }
+      .icon-btn:hover {
+        background: #333;
+        color: var(--fg);
+      }
+      .icon-btn.del:hover {
+        color: #ff6b6b;
+      }
+
+      .rename-input {
+        width: 100%;
+        background: var(--bg);
+        color: var(--fg);
+        border: 1px solid var(--accent);
+        border-radius: 3px;
+        padding: 0.15rem 0.35rem;
+        font: inherit;
+        outline: none;
+      }
+
+      /* Floating sidebar toggle when collapsed */
+      #sidebarToggle {
+        position: fixed;
+        top: 0.85rem;
+        left: 0.85rem;
+        z-index: 20;
+        width: 28px;
+        height: 28px;
+        border-radius: 5px;
+        border: 1px solid var(--line);
+        background: var(--raise);
+        color: var(--dim);
+        display: grid;
+        place-items: center;
+        cursor: pointer;
+        font-size: 13px;
+      }
+      #sidebarToggle:hover {
+        color: var(--fg);
+        border-color: #444;
+      }
+      #sidebar:not(.collapsed) ~ #mainCanvas #sidebarToggle {
+        left: 252px;
+      }
+
+      /* Main Document Canvas */
+      #mainCanvas {
+        flex: 1;
+        height: 100%;
+        overflow-y: auto;
+        position: relative;
+      }
+
+      .doc-container {
         max-width: 740px;
-        min-height: 100vh;
         margin: 0 auto;
-        padding: 3.5rem 1.75rem 8rem;
-        font-size: 1.08rem;
+        padding: 3.75rem 2rem 8rem;
+      }
+
+      #pageTitle {
+        width: 100%;
+        background: transparent;
+        border: 0;
+        color: var(--fg);
+        font-family: var(--font-view);
+        font-size: 2.25rem;
+        font-weight: 700;
+        line-height: 1.2;
+        margin-bottom: 1.25rem;
+        padding: 0;
+        outline: none;
+      }
+      #pageTitle::placeholder {
+        color: #3a3a3a;
+      }
+
+      #editor {
+        min-height: 65vh;
+        font-size: 1.06rem;
         line-height: 1.65;
         outline: none;
         cursor: text;
-      }
-
-      #editor:empty::before {
-        content: 'Start typing...';
-        color: var(--dim);
-        pointer-events: none;
       }
 
       .block {
@@ -692,18 +1311,24 @@
         word-wrap: break-word;
       }
 
-      /* Active block shows clean monospace markdown syntax */
       .block.editing {
         font-family: var(--font-edit);
-        font-size: 0.98rem;
+        font-size: 0.96rem;
         color: var(--fg);
-        background: rgba(255, 255, 255, 0.03);
-        padding: 0.1rem 0.35rem;
-        margin: 0 -0.35rem;
+        background: rgba(255, 255, 255, 0.035);
+        padding: 0.1rem 0.4rem;
+        margin: 0 -0.4rem;
         white-space: pre-wrap;
       }
 
-      /* Rendered block typography */
+      .block.editing:empty::before {
+        content: "Type '/' for commands...";
+        color: #4a4a4a;
+        font-family: var(--font-view);
+        pointer-events: none;
+      }
+
+      /* Rendered Block Typography */
       .block p {
         margin: 0.25em 0;
       }
@@ -718,52 +1343,41 @@
       .block h6 {
         color: var(--fg);
         line-height: 1.25;
-        margin: 0.9em 0 0.25em;
+        margin: 0.95em 0 0.25em;
         font-weight: 650;
       }
-      .block:first-child h1,
-      .block:first-child h2,
-      .block:first-child h3 {
-        margin-top: 0;
-      }
       .block h1 {
-        font-size: 1.9em;
+        font-size: 1.85em;
         padding-bottom: 0.2em;
         border-bottom: 1px solid var(--line);
       }
       .block h2 {
-        font-size: 1.5em;
+        font-size: 1.48em;
         padding-bottom: 0.2em;
         border-bottom: 1px solid var(--line);
       }
       .block h3 {
-        font-size: 1.25em;
+        font-size: 1.24em;
       }
       .block h4 {
-        font-size: 1.1em;
+        font-size: 1.08em;
       }
       .block h5,
       .block h6 {
         font-size: 1em;
         color: var(--dim);
       }
-
       .block hr {
         border: 0;
         border-top: 1px solid #2e2e2e;
-        margin: 1.1rem 0;
+        margin: 1.15rem 0;
       }
-
       .block a {
         color: var(--accent);
         text-decoration: underline;
         text-decoration-color: #74c0fc55;
         text-underline-offset: 0.15em;
       }
-      .block a:hover {
-        text-decoration-color: var(--accent);
-      }
-
       .block code,
       .block pre {
         font-family: var(--font-edit);
@@ -779,7 +1393,7 @@
         background: var(--raise);
         border: 1px solid var(--line);
         border-radius: 6px;
-        padding: 0.8rem 1rem;
+        padding: 0.85rem 1rem;
         overflow-x: auto;
         line-height: 1.5;
         margin: 0.5em 0;
@@ -790,14 +1404,12 @@
         padding: 0;
         font-size: 0.92rem;
       }
-
       .block blockquote {
         margin: 0.35em 0;
-        padding: 0.1rem 1rem;
-        border-left: 3px solid #3a3a3a;
-        color: #a8a8a8;
+        padding: 0.15rem 1rem;
+        border-left: 3px solid #444;
+        color: #b0b0b0;
       }
-
       .block mark {
         background: rgba(255, 212, 59, 0.3);
         color: inherit;
@@ -837,9 +1449,6 @@
         background: transparent;
         cursor: pointer;
       }
-      .md-li input[type='checkbox']:hover {
-        border-color: var(--accent);
-      }
       .md-li input[type='checkbox']:checked {
         background: var(--accent);
         border-color: var(--accent);
@@ -854,77 +1463,322 @@
         transform: translate(0.27em, 0.02em) rotate(45deg);
       }
 
-      /* Minimal floating help trigger */
+      /* Notion-style Command Popup Menu */
+      #cmdMenu {
+        position: fixed;
+        z-index: 50;
+        width: 290px;
+        max-height: 290px;
+        overflow-y: auto;
+        background: #1c1c1c;
+        border: 1px solid #303030;
+        border-radius: 8px;
+        padding: 0.35rem;
+        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+      }
+      #cmdMenu[hidden] {
+        display: none;
+      }
+      .cmd-header {
+        font-size: 0.68rem;
+        font-weight: 600;
+        letter-spacing: 0.05em;
+        color: var(--dim);
+        padding: 0.3rem 0.55rem;
+      }
+      .cmd-item {
+        display: flex;
+        align-items: center;
+        gap: 0.65rem;
+        padding: 0.45rem 0.55rem;
+        border-radius: 5px;
+        cursor: pointer;
+      }
+      .cmd-item.selected {
+        background: #2a2a2a;
+      }
+      .cmd-icon {
+        width: 28px;
+        height: 28px;
+        border-radius: 5px;
+        background: #252525;
+        border: 1px solid #333;
+        display: grid;
+        place-items: center;
+        font-family: var(--font-edit);
+        font-size: 0.78rem;
+        color: var(--fg);
+        flex-shrink: 0;
+      }
+      .cmd-meta {
+        flex: 1;
+        min-width: 0;
+      }
+      .cmd-title {
+        font-size: 0.85rem;
+        font-weight: 500;
+        color: var(--fg);
+      }
+      .cmd-desc {
+        font-size: 0.72rem;
+        color: var(--dim);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .cmd-hint {
+        font-family: var(--font-edit);
+        font-size: 0.72rem;
+        color: var(--dim);
+      }
+
+      /* Floating Help Button & Rich Visual Guide */
       #helpBtn {
         position: fixed;
         right: 1.25rem;
         bottom: 1.25rem;
-        width: 28px;
-        height: 28px;
+        z-index: 30;
+        width: 30px;
+        height: 30px;
         border-radius: 50%;
-        border: 1px solid var(--line);
+        border: 1px solid #333;
         background: var(--raise);
-        color: var(--dim);
-        font: 500 13px/1 var(--font-view);
+        color: #bbb;
+        font: 600 13px/1 var(--font-view);
         display: grid;
         place-items: center;
         cursor: pointer;
-        transition: color 0.15s, border-color 0.15s, background 0.15s;
+        transition: all 0.15s;
       }
-      #helpBtn:hover,
-      #helpBtn:focus-visible {
+      #helpBtn:hover {
         color: var(--fg);
-        border-color: #444;
-        background: #222;
-        outline: none;
+        border-color: var(--accent);
+        background: #252525;
       }
 
       #help {
         position: fixed;
         right: 1.25rem;
-        bottom: 3.5rem;
+        bottom: 3.6rem;
+        z-index: 40;
+        width: 360px;
         max-width: calc(100vw - 2.5rem);
-        background: var(--raise);
+        max-height: 78vh;
+        overflow-y: auto;
+        background: #191919;
         border: 1px solid #303030;
-        border-radius: 8px;
-        padding: 0.85rem 1.1rem;
-        font-size: 12px;
-        line-height: 1.65;
-        color: #bbb;
-        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+        border-radius: 10px;
+        padding: 1rem 1.15rem;
+        font-size: 0.84rem;
+        line-height: 1.5;
+        color: var(--text);
+        box-shadow: 0 14px 36px rgba(0, 0, 0, 0.65);
       }
       #help[hidden] {
         display: none;
       }
-      #help pre {
-        margin: 0;
+
+      .help-title {
+        font-size: 0.75rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--dim);
+        margin-bottom: 0.65rem;
+      }
+
+      .help-grid {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+      }
+
+      .help-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.75rem;
+        padding-bottom: 0.45rem;
+        border-bottom: 1px solid #232323;
+      }
+      .help-row:last-child {
+        border-bottom: 0;
+        padding-bottom: 0;
+      }
+
+      .help-syntax {
         font-family: var(--font-edit);
-        white-space: pre-wrap;
+        font-size: 0.76rem;
+        color: #9e9e9e;
+        background: #121212;
+        padding: 0.18rem 0.42rem;
+        border-radius: 4px;
+        border: 1px solid #262626;
+      }
+
+      .help-preview {
+        text-align: right;
+      }
+      .help-h1 {
+        font-size: 1.15rem;
+        font-weight: 700;
+        color: var(--fg);
+      }
+      .help-h2 {
+        font-size: 0.98rem;
+        font-weight: 650;
+        color: var(--fg);
+      }
+      .help-code-inline {
+        font-family: var(--font-edit);
+        font-size: 0.78rem;
+        background: #242424;
+        border: 1px solid #333;
+        padding: 0.1rem 0.35rem;
+        border-radius: 4px;
+      }
+      .help-code-block {
+        font-family: var(--font-edit);
+        font-size: 0.75rem;
+        background: #121212;
+        border: 1px solid #2b2b2b;
+        border-radius: 5px;
+        padding: 0.35rem 0.55rem;
+        margin-top: 0.35rem;
+        color: #a5d8ff;
+      }
+      .help-quote {
+        border-left: 3px solid #555;
+        padding-left: 0.55rem;
+        color: #aaa;
+      }
+      .help-mark {
+        background: rgba(255, 212, 59, 0.32);
+        padding: 0.05rem 0.3rem;
+        border-radius: 3px;
+      }
+      .help-mark-blue {
+        background: color-mix(in srgb, #74c0fc 35%, transparent);
+        padding: 0.05rem 0.3rem;
+        border-radius: 3px;
+      }
+      .swatch-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.35rem;
+        margin-top: 0.35rem;
+        font-size: 0.76rem;
+        font-weight: 500;
       }
     </style>
   </head>
 
   <body onload="init()">
-    <main id="editor" contenteditable="true" spellcheck="true"></main>
+    <div class="app-shell">
+      <!-- Left Sidebar -->
+      <aside id="sidebar">
+        <div class="sidebar-header">
+          <div class="brand">
+            <img src="./logo.png" alt="Logo" onerror="this.style.display='none'" />
+            <span>Notes</span>
+          </div>
+        </div>
 
+        <div class="sidebar-section-label">
+          <span>PAGES</span>
+          <button type="button" id="newPageBtn" title="New page">+</button>
+        </div>
+
+        <div id="pageList"></div>
+      </aside>
+
+      <!-- Main Notion-like Editor -->
+      <div id="mainCanvas">
+        <button type="button" id="sidebarToggle" title="Toggle sidebar">☰</button>
+
+        <div class="doc-container">
+          <input
+            type="text"
+            id="pageTitle"
+            placeholder="Untitled"
+            autocomplete="off"
+          />
+          <main id="editor" contenteditable="true" spellcheck="true"></main>
+        </div>
+      </div>
+    </div>
+
+    <!-- Slash / Markdown Command Popup -->
+    <div id="cmdMenu" hidden></div>
+
+    <!-- Rich Visual Syntax Help -->
     <div id="help" hidden>
-      <pre>
-# Heading   (# up to ######)
-**bold**  *italic*  ~~strike~~  `code`
-- bullet    1. numbered    - [ ] task
-&gt; quote      ---  divider
-```
-code block
-```
-{red|colored text}   {#ff8800|any hex}
-==highlight==   =={blue|colored highlight}==
-[label](https://example.com)
-
-colors: red orange yellow green teal
-        cyan blue purple pink gray
-
-Tab / Shift+Tab   indent
-Shift + Enter     newline inside block</pre>
+      <div class="help-title">Markdown &amp; Live Formatting</div>
+      <div class="help-grid">
+        <div class="help-row">
+          <span class="help-syntax"># Heading 1</span>
+          <span class="help-preview help-h1">Heading 1</span>
+        </div>
+        <div class="help-row">
+          <span class="help-syntax">## Heading 2</span>
+          <span class="help-preview help-h2">Heading 2</span>
+        </div>
+        <div class="help-row">
+          <span class="help-syntax">**bold** / *italic*</span>
+          <span class="help-preview"><strong>bold</strong> / <em>italic</em></span>
+        </div>
+        <div class="help-row">
+          <span class="help-syntax">~~strike~~ / `code`</span>
+          <span class="help-preview"><del>strike</del> / <span class="help-code-inline">code</span></span>
+        </div>
+        <div class="help-row">
+          <span class="help-syntax">- [ ] Task item</span>
+          <span class="help-preview">☑ Interactive checkbox</span>
+        </div>
+        <div class="help-row">
+          <span class="help-syntax">&gt; Quote block</span>
+          <span class="help-preview"><span class="help-quote">Quote block</span></span>
+        </div>
+        <div class="help-row">
+          <span class="help-syntax">==highlight==</span>
+          <span class="help-preview"><span class="help-mark">highlight</span></span>
+        </div>
+        <div class="help-row">
+          <span class="help-syntax">=={blue|colored}==</span>
+          <span class="help-preview"><span class="help-mark-blue">colored</span></span>
+        </div>
+        <div class="help-row">
+          <span class="help-syntax">{red|colored text}</span>
+          <span class="help-preview" style="color: #ff6b6b; font-weight: 500">colored text</span>
+        </div>
+        <div>
+          <span class="help-syntax">``` code block ```</span>
+          <div class="help-code-block">const notes = "live markdown";</div>
+        </div>
+        <div>
+          <div class="help-syntax" style="display: inline-block">Available {color|...} names:</div>
+          <div class="swatch-list">
+            <span style="color: #ff6b6b">red</span>
+            <span style="color: #ffa94d">orange</span>
+            <span style="color: #ffd43b">yellow</span>
+            <span style="color: #69db7c">green</span>
+            <span style="color: #38d9a9">teal</span>
+            <span style="color: #3bc9db">cyan</span>
+            <span style="color: #74c0fc">blue</span>
+            <span style="color: #b197fc">purple</span>
+            <span style="color: #f783ac">pink</span>
+            <span style="color: #868e96">gray</span>
+          </div>
+        </div>
+        <div class="help-row" style="margin-top: 0.25rem">
+          <span class="help-syntax">/ or - or &gt;</span>
+          <span class="help-preview" style="color: var(--dim)">Open command popup</span>
+        </div>
+        <div class="help-row">
+          <span class="help-syntax">Tab / Shift+Tab</span>
+          <span class="help-preview" style="color: var(--dim)">Indent / Outdent</span>
+        </div>
+      </div>
     </div>
 
     <button type="button" id="helpBtn" title="Markdown syntax" aria-label="Markdown syntax">?</button>
