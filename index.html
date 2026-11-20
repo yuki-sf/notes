@@ -6,6 +6,2588 @@
     <meta name="author" content="Hizkia Felix - hizkifw.me" />
     <meta
       name="description"
+      content="Dark theme Notion-like notes with live markdown, subpages, and rich link embeds"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      var LS_PAGES = 'notes-pages-v2';
+      var LS_ACTIVE = 'notes-active-v2';
+      var LS_TIME = 'notes-lastsave-v2';
+      var LS_LEGACY_V1 = 'notes-pages-v1';
+      var LS_LEGACY_DOC = 'doc';
+
+      /* ------------------------------------------------------------------
+       * Markdown Inline & Block Renderer
+       * ------------------------------------------------------------------ */
+
+      var PALETTE = {
+        red: '#ff6b6b',
+        orange: '#ffa94d',
+        yellow: '#ffd43b',
+        green: '#69db7c',
+        teal: '#38d9a9',
+        cyan: '#3bc9db',
+        blue: '#74c0fc',
+        purple: '#b197fc',
+        pink: '#f783ac',
+        gray: '#868e96',
+        grey: '#868e96',
+      };
+      var COLOR = '([a-zA-Z]+|#[0-9a-fA-F]{3,8})';
+
+      function colorOf(c) {
+        return PALETTE[c.toLowerCase()] || c;
+      }
+
+      function esc(s) {
+        return String(s)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;');
+      }
+
+      function safeUrl(u) {
+        return (
+          /^(https?:\/\/|mailto:|tel:|#|\/|\.\.?\/)/i.test(u) ||
+          !/^[a-z][a-z0-9+.\-]*:/i.test(u)
+        );
+      }
+
+      function inline(s) {
+        var st = [];
+        function keep(h) {
+          return '\u0001' + (st.push(h) - 1) + '\u0001';
+        }
+        s = s.replace(/[\u0000-\u0002]/g, '');
+
+        // `code`
+        s = s.replace(/`([^`]+)`/g, function (_, c) {
+          return keep('<code>' + esc(c) + '</code>');
+        });
+        s = esc(s);
+
+        // [label](url)
+        s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, function (m, t, u) {
+          if (!safeUrl(u)) return m;
+          if (/^www\./i.test(u)) u = 'https://' + u;
+          return (
+            keep('<a href="' + u + '" target="_blank" rel="noopener noreferrer">') +
+            t +
+            '\u0002'
+          );
+        });
+
+        // bare links
+        s = s.replace(/(^|[\s(])(https?:\/\/[^\s]+)/g, function (m, pre, u) {
+          var tail = (u.match(/[.,;:!?)]+$/) || [''])[0];
+          u = u.slice(0, u.length - tail.length);
+          return (
+            pre +
+            keep(
+              '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + u + '</a>'
+            ) +
+            tail
+          );
+        });
+
+        // emphasis
+        s = s
+          .replace(/\*\*\*(\S(?:.*?\S)?)\*\*\*/g, '<strong><em>$1</em></strong>')
+          .replace(/\*\*(\S(?:.*?\S)?)\*\*/g, '<strong>$1</strong>')
+          .replace(/__(\S(?:.*?\S)?)__/g, '<strong>$1</strong>')
+          .replace(/~~(\S(?:.*?\S)?)~~/g, '<del>$1</del>')
+          .replace(/\*(\S(?:.*?\S)?)\*/g, '<em>$1</em>')
+          .replace(/(^|[^\w])_(\S(?:.*?\S)?)_(?!\w)/g, '$1<em>$2</em>');
+
+        // =={color|text}== and ==text==
+        s = s
+          .replace(
+            new RegExp('==\\{' + COLOR + '\\|([^}]+)\\}==', 'g'),
+            function (_, c, t) {
+              return (
+                '<mark style="background:color-mix(in srgb, ' +
+                colorOf(c) +
+                ' 35%, transparent)">' +
+                t +
+                '</mark>'
+              );
+            }
+          )
+          .replace(/==(\S(?:.*?\S)?)==/g, '<mark>$1</mark>');
+
+        // {color|text}
+        s = s.replace(
+          new RegExp('\\{' + COLOR + '\\|([^}]+)\\}', 'g'),
+          function (_, c, t) {
+            return '<span style="color:' + colorOf(c) + '">' + t + '</span>';
+          }
+        );
+
+        return s
+          .replace(/\u0001(\d+)\u0001/g, function (_, n) {
+            return st[+n];
+          })
+          .replace(/\u0002/g, '</a>');
+      }
+
+      var RE_FENCE = /^\s*(```|~~~)/;
+      var RE_HEAD = /^(#{1,6})\s+(.*)$/;
+      var RE_HR = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/;
+      var RE_QUOTE = /^\s{0,3}>\s?(.*)$/;
+      var RE_LI = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
+      var RE_SUBPAGE = /^\[\[page:([a-zA-Z0-9_-]+)\]\]$/;
+      var RE_SOLO_URL = /^(?:\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s]+))$/;
+
+      /* ------------------------------------------------------------------
+       * Rich Link Embed & Media Helpers
+       * ------------------------------------------------------------------ */
+
+      function getYouTubeId(url) {
+        var m = url.match(
+          /(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/
+        );
+        return m ? m[1] : null;
+      }
+
+      function getVimeoId(url) {
+        var m = url.match(/vimeo\.com\/(?:video\/)?(\d+)/);
+        return m ? m[1] : null;
+      }
+
+      function renderLinkEmbed(url, label) {
+        var cleanUrl = url.trim();
+        var pathOnly = cleanUrl.split('?')[0].split('#')[0];
+
+        // 1. Direct Image Embed
+        if (/\.(png|jpe?g|gif|webp|svg|avif)$/i.test(pathOnly)) {
+          return (
+            '<div class="embed-media">' +
+            '<img src="' +
+            esc(cleanUrl) +
+            '" alt="' +
+            esc(label || 'Embedded image') +
+            '" loading="lazy" />' +
+            (label && label !== cleanUrl
+              ? '<div class="embed-caption">' + esc(label) + '</div>'
+              : '') +
+            '</div>'
+          );
+        }
+
+        // 2. Direct Video File Embed
+        if (/\.(mp4|webm|ogg|mov)$/i.test(pathOnly)) {
+          return (
+            '<div class="embed-media">' +
+            '<video src="' +
+            esc(cleanUrl) +
+            '" controls preload="metadata"></video>' +
+            '</div>'
+          );
+        }
+
+        // 3. YouTube Thumbnail + Click-to-Play / Iframe Embed
+        var ytId = getYouTubeId(cleanUrl);
+        if (ytId) {
+          var thumb = '[https://img.youtube.com/vi/](https://img.youtube.com/vi/)' + ytId + '/hqdefault.jpg';
+          return (
+            '<div class="embed-video-card" data-yt="' +
+            esc(ytId) +
+            '">' +
+            '<img src="' +
+            thumb +
+            '" alt="YouTube thumbnail" loading="lazy" />' +
+            '<div class="embed-play-badge">▶ Play Video</div>' +
+            '<a class="embed-ext-link" href="' +
+            esc(cleanUrl) +
+            '" target="_blank" rel="noopener noreferrer">' +
+            esc(label || cleanUrl) +
+            '</a>' +
+            '</div>'
+          );
+        }
+
+        // 4. Vimeo Embed
+        var vimeoId = getVimeoId(cleanUrl);
+        if (vimeoId) {
+          return (
+            '<div class="embed-iframe-wrap">' +
+            '<iframe src="[https://player.vimeo.com/video/](https://player.vimeo.com/video/)' +
+            esc(vimeoId) +
+            '" frameborder="0" allowfullscreen loading="lazy"></iframe>' +
+            '</div>'
+          );
+        }
+
+        // 5. Rich Web Bookmark Card (Favicon + Domain + Title)
+        var domain = cleanUrl;
+        var path = '';
+        try {
+          var uObj = new URL(cleanUrl);
+          domain = uObj.hostname.replace(/^www\./, '');
+          path = uObj.pathname !== '/' ? uObj.pathname : '';
+        } catch (e) {}
+
+        var favicon =
+          '[https://www.google.com/s2/favicons?domain=](https://www.google.com/s2/favicons?domain=)' + encodeURIComponent(domain) + '&sz=64';
+        var displayTitle = label && label !== cleanUrl ? label : domain + path;
+
+        return (
+          '<a class="embed-bookmark" href="' +
+          esc(cleanUrl) +
+          '" target="_blank" rel="noopener noreferrer">' +
+          '<div class="bookmark-info">' +
+          '<div class="bookmark-title">' +
+          esc(displayTitle) +
+          '</div>' +
+          '<div class="bookmark-url">' +
+          esc(cleanUrl) +
+          '</div>' +
+          '<div class="bookmark-domain">' +
+          '<img src="' +
+          favicon +
+          '" alt="" onerror="this.style.display=\'none\'" />' +
+          '<span>' +
+          esc(domain) +
+          '</span>' +
+          '</div>' +
+          '</div>' +
+          '</a>'
+        );
+      }
+
+      /* ------------------------------------------------------------------
+       * Block Parsing & Rendering
+       * ------------------------------------------------------------------ */
+
+      function parseBlocks(text) {
+        var lines = text.replace(/\r\n?/g, '\n').split('\n');
+        var blocks = [];
+        var i = 0;
+        while (i < lines.length) {
+          var m = lines[i].match(RE_FENCE);
+          if (m) {
+            var fence = m[1];
+            var startLine = i;
+            var buf = [lines[i++]];
+            while (i < lines.length) {
+              buf.push(lines[i]);
+              if (lines[i].trim().indexOf(fence) === 0) {
+                i++;
+                break;
+              }
+              i++;
+            }
+            blocks.push({ raw: buf.join('\n'), startLine: startLine, isFence: true });
+          } else {
+            blocks.push({ raw: lines[i], startLine: i, isFence: false });
+            i++;
+          }
+        }
+        return blocks;
+      }
+
+      function renderSingleBlock(block, pagesMap) {
+        var raw = block.raw;
+
+        // Code Block
+        if (block.isFence) {
+          var lines = raw.split('\n');
+          var lang = lines[0].replace(/^\s*(```|~~~)/, '').trim();
+          var inner = lines.slice(1);
+          if (inner.length && RE_FENCE.test(inner[inner.length - 1])) {
+            inner.pop();
+          }
+          var codeBody = esc(inner.join('\n'));
+          return (
+            '<div class="code-wrap">' +
+            (lang ? '<span class="code-lang">' + esc(lang) + '</span>' : '') +
+            '<pre><code>' +
+            (codeBody || ' ') +
+            '</code></pre>' +
+            '</div>'
+          );
+        }
+
+        if (/^\s*$/.test(raw)) {
+          return '<div class="md-empty"><br></div>';
+        }
+
+        var m;
+
+        // Embedded Subpage Card [[page:id]]
+        if ((m = raw.trim().match(RE_SUBPAGE))) {
+          var targetId = m[1];
+          var sub = pagesMap && pagesMap[targetId];
+          var title = sub ? sub.title.trim() || 'Untitled' : 'Deleted Subpage';
+          return (
+            '<div class="subpage-card" data-subpage-id="' +
+            esc(targetId) +
+            '">' +
+            '<span class="subpage-icon">📄</span>' +
+            '<span class="subpage-title">' +
+            esc(title) +
+            '</span>' +
+            '<span class="subpage-arrow">↗</span>' +
+            '</div>'
+          );
+        }
+
+        // Heading
+        if ((m = raw.match(RE_HEAD))) {
+          var lvl = m[1].length;
+          return (
+            '<h' +
+            lvl +
+            '>' +
+            (inline(m[2].replace(/\s+#+\s*$/, '')) || '&nbsp;') +
+            '</h' +
+            lvl +
+            '>'
+          );
+        }
+
+        // Divider
+        if (RE_HR.test(raw)) {
+          return '<div class="hr-block"><hr></div>';
+        }
+
+        // Blockquote
+        if ((m = raw.match(RE_QUOTE))) {
+          return '<blockquote>' + (inline(m[1]) || '&nbsp;') + '</blockquote>';
+        }
+
+        // List / Checklist
+        if ((m = raw.match(RE_LI))) {
+          var indent = m[1].replace(/\t/g, '    ').length;
+          var pad = Math.floor(indent / 2) * 1.4;
+          var marker = m[2];
+          var content = m[3];
+          var task = content.match(/^\[( |x|X)\](?:\s+(.*))?$/);
+
+          if (task) {
+            var done = task[1] !== ' ';
+            return (
+              '<div class="md-li task' +
+              (done ? ' done' : '') +
+              '" style="padding-left:' +
+              (1.6 + pad) +
+              'rem">' +
+              '<input type="checkbox" data-line="' +
+              block.startLine +
+              '"' +
+              (done ? ' checked' : '') +
+              '>' +
+              '<span>' +
+              (inline(task[2] || '') || '&nbsp;') +
+              '</span></div>'
+            );
+          }
+
+          var bullet = /\d/.test(marker) ? marker : '•';
+          return (
+            '<div class="md-li" style="padding-left:' +
+            (1.6 + pad) +
+            'rem">' +
+            '<span class="md-bullet">' +
+            esc(bullet) +
+            '</span>' +
+            '<span>' +
+            (inline(content) || '&nbsp;') +
+            '</span></div>'
+          );
+        }
+
+        // Standalone Link or [label](url) -> Rich Media / Bookmark Embed
+        if ((m = raw.trim().match(RE_SOLO_URL))) {
+          var label = m[1] || '';
+          var url = m[2] || m[3];
+          if (safeUrl(url)) {
+            return renderLinkEmbed(url, label);
+          }
+        }
+
+        return '<p>' + inline(raw) + '</p>';
+      }
+
+      /* ------------------------------------------------------------------
+       * Slash / Markdown Command Menu Definitions
+       * ------------------------------------------------------------------ */
+
+      var COMMANDS = [
+        { id: 'subpage', label: 'Subpage', desc: 'Embed a nested page inside this page', icon: '📄', hint: '[[page]]' },
+        { id: 'h1', label: 'Heading 1', syntax: '# ', desc: 'Large section heading', icon: 'H1', hint: '#' },
+        { id: 'h2', label: 'Heading 2', syntax: '## ', desc: 'Medium section heading', icon: 'H2', hint: '##' },
+        { id: 'h3', label: 'Heading 3', syntax: '### ', desc: 'Small section heading', icon: 'H3', hint: '###' },
+        { id: 'todo', label: 'To-do list', syntax: '- [ ] ', desc: 'Track tasks with a checkbox', icon: '☑', hint: '- [ ]' },
+        { id: 'bullet', label: 'Bulleted list', syntax: '- ', desc: 'Create a simple bulleted list', icon: '•', hint: '-' },
+        { id: 'number', label: 'Numbered list', syntax: '1. ', desc: 'Create a list with numbering', icon: '1.', hint: '1.' },
+        { id: 'quote', label: 'Quote', syntax: '> ', desc: 'Capture a quote or callout', icon: '”', hint: '>' },
+        { id: 'code', label: 'Code block', syntax: '```\n\n```', desc: 'Multi-line code snippet', icon: '</>', hint: '```' },
+        { id: 'divider', label: 'Divider', syntax: '---', desc: 'Visually divide blocks', icon: '—', hint: '---' },
+        { id: 'highlight', label: 'Highlight text', wrap: ['==', '=='], desc: 'Yellow text highlight', icon: '🖍', hint: '==text==' },
+        { id: 'highlight-blue', label: 'Blue highlight', wrap: ['=={blue|', '}=='], desc: 'Blue background highlight', icon: '🖍', hint: '=={blue|}==' },
+        { id: 'color-red', label: 'Red text', wrap: ['{red|', '}'], desc: 'Color text red', icon: 'A', color: '#ff6b6b', hint: '{red|}' },
+        { id: 'color-blue', label: 'Blue text', wrap: ['{blue|', '}'], desc: 'Color text blue', icon: 'A', color: '#74c0fc', hint: '{blue|}' },
+        { id: 'color-green', label: 'Green text', wrap: ['{green|', '}'], desc: 'Color text green', icon: 'A', color: '#69db7c', hint: '{green|}' },
+        { id: 'color-purple', label: 'Purple text', wrap: ['{purple|', '}'], desc: 'Color text purple', icon: 'A', color: '#b197fc', hint: '{purple|}' },
+      ];
+
+      /* ------------------------------------------------------------------
+       * App
+       * ------------------------------------------------------------------ */
+
+      function init() {
+        var editor = document.getElementById('editor');
+        var pageTitleEl = document.getElementById('pageTitle');
+        var pageListEl = document.getElementById('pageList');
+        var breadcrumbEl = document.getElementById('breadcrumbs');
+        var help = document.getElementById('help');
+        var cmdMenu = document.getElementById('cmdMenu');
+        var selToolbar = document.getElementById('selToolbar');
+        var sidebar = document.getElementById('sidebar');
+
+        var pages = [];
+        var activePageId = null;
+        var lastSave = Number(localStorage.getItem(LS_TIME)) || Date.now();
+        var activeIdx = -1;
+        var collapsedPages = {};
+
+        var cmdOpen = false;
+        var cmdMatches = [];
+        var cmdSelected = 0;
+
+        function uid() {
+          return 'p_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        }
+
+        function loadState() {
+          try {
+            var stored = JSON.parse(localStorage.getItem(LS_PAGES));
+            if (!Array.isArray(stored) || stored.length === 0) {
+              stored = JSON.parse(localStorage.getItem(LS_LEGACY_V1));
+            }
+            if (Array.isArray(stored) && stored.length > 0) {
+              pages = stored.map(function (p) {
+                return {
+                  id: p.id || uid(),
+                  parentId: p.parentId || null,
+                  title: p.title != null ? p.title : 'Untitled',
+                  content: p.content || '',
+                };
+              });
+            } else {
+              var legacy = localStorage.getItem(LS_LEGACY_DOC) || '';
+              pages = [
+                {
+                  id: uid(),
+                  parentId: null,
+                  title: 'Getting Started',
+                  content: legacy,
+                },
+              ];
+            }
+          } catch (e) {
+            pages = [{ id: uid(), parentId: null, title: 'Untitled', content: '' }];
+          }
+
+          var savedActive = localStorage.getItem(LS_ACTIVE);
+          activePageId = pages.some(function (p) {
+            return p.id === savedActive;
+          })
+            ? savedActive
+            : pages[0].id;
+        }
+
+        function getPagesMap() {
+          var map = {};
+          pages.forEach(function (p) {
+            map[p.id] = p;
+          });
+          return map;
+        }
+
+        function currentPage() {
+          return (
+            pages.find(function (p) {
+              return p.id === activePageId;
+            }) || pages[0]
+          );
+        }
+
+        function saveState() {
+          lastSave = Date.now();
+          try {
+            localStorage.setItem(LS_PAGES, JSON.stringify(pages));
+            localStorage.setItem(LS_ACTIVE, activePageId);
+            localStorage.setItem(LS_TIME, lastSave);
+          } catch (e) {
+            console.error(e);
+          }
+        }
+
+        /* --- Breadcrumbs & Nested Page Tree Sidebar --- */
+
+        function renderBreadcrumbs() {
+          var map = getPagesMap();
+          var chain = [];
+          var cur = currentPage();
+          var guard = 0;
+          while (cur && guard++ < 15) {
+            chain.unshift(cur);
+            cur = cur.parentId ? map[cur.parentId] : null;
+          }
+
+          breadcrumbEl.innerHTML = '';
+          if (chain.length <= 1) {
+            breadcrumbEl.hidden = true;
+            return;
+          }
+          breadcrumbEl.hidden = false;
+          chain.forEach(function (p, idx) {
+            if (idx > 0) {
+              var sep = document.createElement('span');
+              sep.className = 'crumb-sep';
+              sep.textContent = '/';
+              breadcrumbEl.appendChild(sep);
+            }
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'crumb-btn' + (p.id === activePageId ? ' current' : '');
+            btn.textContent = p.title.trim() || 'Untitled';
+            btn.addEventListener('click', function () {
+              if (p.id !== activePageId) switchPage(p.id);
+            });
+            breadcrumbEl.appendChild(btn);
+          });
+        }
+
+        function renderSidebar() {
+          pageListEl.innerHTML = '';
+
+          function renderBranch(parentId, depth) {
+            var children = pages.filter(function (p) {
+              return (p.parentId || null) === parentId;
+            });
+
+            children.forEach(function (page) {
+              var hasKids = pages.some(function (p) {
+                return p.parentId === page.id;
+              });
+              var isCollapsed = !!collapsedPages[page.id];
+
+              var item = document.createElement('div');
+              item.className = 'page-item' + (page.id === activePageId ? ' active' : '');
+              item.style.paddingLeft = 0.55 + depth * 0.95 + 'rem';
+
+              var toggle = document.createElement('span');
+              toggle.className = 'tree-toggle' + (hasKids ? '' : ' empty');
+              toggle.textContent = hasKids ? (isCollapsed ? '▸' : '▾') : '•';
+              if (hasKids) {
+                toggle.addEventListener('click', function (e) {
+                  e.stopPropagation();
+                  collapsedPages[page.id] = !collapsedPages[page.id];
+                  renderSidebar();
+                });
+              }
+
+              var nameSpan = document.createElement('span');
+              nameSpan.className = 'page-name';
+              nameSpan.textContent = page.title.trim() || 'Untitled';
+              nameSpan.title = 'Click to open • Double-click to rename';
+
+              nameSpan.addEventListener('click', function () {
+                if (page.id !== activePageId) switchPage(page.id);
+              });
+
+              nameSpan.addEventListener('dblclick', function (e) {
+                e.stopPropagation();
+                startInlineRename(page, item, nameSpan);
+              });
+
+              var actions = document.createElement('div');
+              actions.className = 'page-actions';
+
+              var addSubBtn = document.createElement('button');
+              addSubBtn.type = 'button';
+              addSubBtn.className = 'icon-btn';
+              addSubBtn.title = 'Add subpage';
+              addSubBtn.textContent = '+';
+              addSubBtn.addEventListener('click', function (e) {
+                e.stopPropagation();
+                createSubpage(page.id, false);
+              });
+
+              var renameBtn = document.createElement('button');
+              renameBtn.type = 'button';
+              renameBtn.className = 'icon-btn';
+              renameBtn.title = 'Rename page';
+              renameBtn.textContent = '✎';
+              renameBtn.addEventListener('click', function (e) {
+                e.stopPropagation();
+                startInlineRename(page, item, nameSpan);
+              });
+
+              actions.appendChild(addSubBtn);
+              actions.appendChild(renameBtn);
+
+              if (pages.length > 1) {
+                var delBtn = document.createElement('button');
+                delBtn.type = 'button';
+                delBtn.className = 'icon-btn del';
+                delBtn.title = 'Delete page';
+                delBtn.textContent = '×';
+                delBtn.addEventListener('click', function (e) {
+                  e.stopPropagation();
+                  deletePage(page.id);
+                });
+                actions.appendChild(delBtn);
+              }
+
+              item.appendChild(toggle);
+              item.appendChild(nameSpan);
+              item.appendChild(actions);
+              pageListEl.appendChild(item);
+
+              if (hasKids && !isCollapsed) {
+                renderBranch(page.id, depth + 1);
+              }
+            });
+          }
+
+          renderBranch(null, 0);
+        }
+
+        function startInlineRename(page, itemEl, nameSpan) {
+          var input = document.createElement('input');
+          input.type = 'text';
+          input.className = 'rename-input';
+          input.value = page.title;
+          itemEl.replaceChild(input, nameSpan);
+          input.focus();
+          input.select();
+
+          function commit() {
+            page.title = input.value.trim() || 'Untitled';
+            if (page.id === activePageId) {
+              pageTitleEl.value = page.title;
+            }
+            saveState();
+            renderSidebar();
+            renderBreadcrumbs();
+            renderAll(activeIdx);
+          }
+
+          input.addEventListener('blur', commit);
+          input.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              input.blur();
+            } else if (e.key === 'Escape') {
+              renderSidebar();
+            }
+          });
+        }
+
+        function switchPage(id) {
+          if (activeIdx >= 0) syncFromDOM();
+          closeCmdMenu();
+          hideSelectionToolbar();
+          activePageId = id;
+          var page = currentPage();
+          pageTitleEl.value = page.title;
+          saveState();
+          renderSidebar();
+          renderBreadcrumbs();
+          renderAll(page.content ? -1 : 0, 0);
+        }
+
+        function createSubpage(parentId, embedInCurrentBlock) {
+          if (activeIdx >= 0) syncFromDOM();
+          closeCmdMenu();
+          var newPage = {
+            id: uid(),
+            parentId: parentId || null,
+            title: 'Untitled',
+            content: '',
+          };
+          pages.push(newPage);
+
+          if (embedInCurrentBlock && parentId) {
+            var parent = pages.find(function (p) {
+              return p.id === parentId;
+            });
+            if (parent) {
+              var blocks = parseBlocks(parent.content);
+              var lines = parent.content.split('\n');
+              var targetLine =
+                activeIdx >= 0 && blocks[activeIdx] ? blocks[activeIdx].startLine : lines.length;
+              lines[targetLine] = '[[page:' + newPage.id + ']]';
+              parent.content = lines.join('\n');
+            }
+          }
+
+          collapsedPages[parentId] = false;
+          activePageId = newPage.id;
+          pageTitleEl.value = newPage.title;
+          saveState();
+          renderSidebar();
+          renderBreadcrumbs();
+          renderAll(-1);
+          pageTitleEl.focus();
+          pageTitleEl.select();
+        }
+
+        function deletePage(id) {
+          if (pages.length <= 1) return;
+
+          // Collect target page and all nested descendants
+          var toDelete = {};
+          function markDescendants(pid) {
+            toDelete[pid] = true;
+            pages.forEach(function (p) {
+              if (p.parentId === pid) markDescendants(p.id);
+            });
+          }
+          markDescendants(id);
+
+          pages = pages.filter(function (p) {
+            return !toDelete[p.id];
+          });
+
+          if (pages.length === 0) {
+            pages = [{ id: uid(), parentId: null, title: 'Untitled', content: '' }];
+          }
+
+          if (toDelete[activePageId]) {
+            activePageId = pages[0].id;
+            pageTitleEl.value = currentPage().title;
+            renderAll(-1);
+          }
+          saveState();
+          renderSidebar();
+          renderBreadcrumbs();
+        }
+
+        pageTitleEl.addEventListener('input', function () {
+          var page = currentPage();
+          page.title = pageTitleEl.value;
+          saveState();
+          renderSidebar();
+          renderBreadcrumbs();
+        });
+
+        pageTitleEl.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            editor.focus();
+            renderAll(0, 0);
+          }
+        });
+
+        document.getElementById('newPageBtn').addEventListener('click', function () {
+          createSubpage(null, false);
+        });
+        document.getElementById('sidebarToggle').addEventListener('click', function () {
+          sidebar.classList.toggle('collapsed');
+        });
+
+        /* --- DOM Text & Caret Helpers --- */
+
+        function setPlainText(el, text) {
+          el.innerHTML = '';
+          if (!text) {
+            el.appendChild(document.createElement('br'));
+            return;
+          }
+          var parts = text.split('\n');
+          parts.forEach(function (part, idx) {
+            if (idx > 0) el.appendChild(document.createElement('br'));
+            if (part) el.appendChild(document.createTextNode(part));
+          });
+        }
+
+        function getPlainText(el) {
+          var text = '';
+          el.childNodes.forEach(function (node) {
+            if (node.nodeType === 3) {
+              text += node.nodeValue;
+            } else if (node.nodeName === 'BR') {
+              text += '\n';
+            } else {
+              text += node.innerText || node.textContent || '';
+            }
+          });
+          return text.replace(/\n$/, '');
+        }
+
+        function getSelectionOffsets(el) {
+          var sel = window.getSelection();
+          if (!sel.rangeCount) return { start: 0, end: 0 };
+          var range = sel.getRangeAt(0);
+          if (!el.contains(range.commonAncestorContainer)) return { start: 0, end: 0 };
+
+          var preStart = range.cloneRange();
+          preStart.selectNodeContents(el);
+          preStart.setEnd(range.startContainer, range.startOffset);
+          var divS = document.createElement('div');
+          divS.appendChild(preStart.cloneContents());
+          var start = getPlainText(divS).length;
+
+          var preEnd = range.cloneRange();
+          preEnd.selectNodeContents(el);
+          preEnd.setEnd(range.endContainer, range.endOffset);
+          var divE = document.createElement('div');
+          divE.appendChild(preEnd.cloneContents());
+          var end = getPlainText(divE).length;
+
+          return { start: start, end: end };
+        }
+
+        function getCaretOffset(el) {
+          return getSelectionOffsets(el).end;
+        }
+
+        function setCaretOffset(el, offset) {
+          var sel = window.getSelection();
+          var range = document.createRange();
+          var pos = 0;
+          var placed = false;
+
+          function walk(node) {
+            if (placed) return;
+            if (node.nodeType === 3) {
+              var len = node.nodeValue.length;
+              if (pos + len >= offset) {
+                range.setStart(node, Math.max(0, offset - pos));
+                range.collapse(true);
+                placed = true;
+              } else {
+                pos += len;
+              }
+            } else if (node.nodeName === 'BR') {
+              if (pos === offset) {
+                range.setStartBefore(node);
+                range.collapse(true);
+                placed = true;
+              }
+              pos += 1;
+            } else {
+              for (var i = 0; i < node.childNodes.length; i++) {
+                walk(node.childNodes[i]);
+              }
+            }
+          }
+
+          walk(el);
+          if (!placed) {
+            range.selectNodeContents(el);
+            range.collapse(false);
+          }
+          sel.removeAllRanges();
+          sel.addRange(range);
+        }
+
+        function syncFromDOM() {
+          var blockEls = editor.querySelectorAll('.block');
+          var lines = [];
+          blockEls.forEach(function (el, idx) {
+            if (idx === activeIdx) {
+              lines.push(getPlainText(el));
+            } else {
+              lines.push(el.dataset.raw);
+            }
+          });
+          currentPage().content = lines.join('\n');
+          saveState();
+        }
+
+        function renderAll(focusIdx, caretPos) {
+          var rawText = currentPage().content;
+          var blocks = parseBlocks(rawText);
+          if (blocks.length === 0) blocks = [{ raw: '', startLine: 0, isFence: false }];
+          activeIdx = focusIdx;
+          var pagesMap = getPagesMap();
+
+          editor.innerHTML = '';
+          blocks.forEach(function (b, idx) {
+            var div = document.createElement('div');
+            div.className = 'block';
+            div.dataset.idx = idx;
+            div.dataset.raw = b.raw;
+
+            if (idx === activeIdx) {
+              div.classList.add('editing');
+              setPlainText(div, b.raw);
+            } else {
+              div.innerHTML = renderSingleBlock(b, pagesMap);
+            }
+            editor.appendChild(div);
+          });
+
+          if (activeIdx >= 0 && editor.children[activeIdx]) {
+            setCaretOffset(editor.children[activeIdx], caretPos != null ? caretPos : 0);
+          }
+        }
+
+        function activateBlock(idx, clickEvent) {
+          if (idx === activeIdx) return;
+          if (activeIdx >= 0) syncFromDOM();
+
+          var caretPos = null;
+          if (clickEvent && document.caretRangeFromPoint) {
+            var r = document.caretRangeFromPoint(clickEvent.clientX, clickEvent.clientY);
+            if (r) {
+              var clickedBlock = editor.children[idx];
+              if (clickedBlock && clickedBlock.contains(r.startContainer)) {
+                var pre = r.cloneRange();
+                pre.selectNodeContents(clickedBlock);
+                pre.setEnd(r.startContainer, r.startOffset);
+                caretPos = pre.toString().length;
+              }
+            }
+          }
+
+          renderAll(idx, caretPos);
+        }
+
+        /* --- Floating Selection Toolbar (Color, Highlight, Bold, Italic, Code) --- */
+
+        function hideSelectionToolbar() {
+          selToolbar.hidden = true;
+        }
+
+        function updateSelectionToolbar() {
+          var sel = window.getSelection();
+          if (!sel || sel.isCollapsed || !sel.rangeCount || activeIdx < 0) {
+            hideSelectionToolbar();
+            return;
+          }
+          var el = editor.children[activeIdx];
+          if (!el || !el.contains(sel.anchorNode) || !el.contains(sel.focusNode)) {
+            hideSelectionToolbar();
+            return;
+          }
+
+          var range = sel.getRangeAt(0);
+          var rect = range.getBoundingClientRect();
+          if (rect.width === 0) {
+            hideSelectionToolbar();
+            return;
+          }
+
+          selToolbar.hidden = false;
+          var tbRect = selToolbar.getBoundingClientRect();
+          var top = rect.top - tbRect.height - 8;
+          if (top < 8) top = rect.bottom + 8;
+          var left = Math.max(
+            12,
+            Math.min(window.innerWidth - tbRect.width - 12, rect.left + rect.width / 2 - tbRect.width / 2)
+          );
+          selToolbar.style.top = top + 'px';
+          selToolbar.style.left = left + 'px';
+        }
+
+        function wrapSelectedText(prefix, suffix) {
+          if (activeIdx < 0 || !editor.children[activeIdx]) return;
+          var el = editor.children[activeIdx];
+          var offsets = getSelectionOffsets(el);
+          if (offsets.start === offsets.end) return;
+
+          var text = getPlainText(el);
+          var selected = text.slice(offsets.start, offsets.end);
+          var nextText =
+            text.slice(0, offsets.start) + prefix + selected + suffix + text.slice(offsets.end);
+
+          setPlainText(el, nextText);
+          el.dataset.raw = nextText;
+          setCaretOffset(el, offsets.start + prefix.length + selected.length + suffix.length);
+          syncFromDOM();
+          hideSelectionToolbar();
+        }
+
+        selToolbar.addEventListener('mousedown', function (e) {
+          var btn = e.target.closest('[data-wrap-pre]');
+          if (!btn) return;
+          e.preventDefault();
+          wrapSelectedText(btn.dataset.wrapPre, btn.dataset.wrapSuf);
+        });
+
+        /* --- Notion-like Slash / Command Popup Menu --- */
+
+        function closeCmdMenu() {
+          cmdOpen = false;
+          cmdMenu.hidden = true;
+        }
+
+        function renderCmdMenu() {
+          cmdMenu.innerHTML = '<div class="cmd-header">BLOCKS &amp; FORMATTING</div>';
+          cmdMatches.forEach(function (cmd, idx) {
+            var row = document.createElement('div');
+            row.className = 'cmd-item' + (idx === cmdSelected ? ' selected' : '');
+            var iconStyle = cmd.color ? ' style="color:' + cmd.color + ';font-weight:700"' : '';
+            row.innerHTML =
+              '<span class="cmd-icon"' +
+              iconStyle +
+              '>' +
+              esc(cmd.icon) +
+              '</span>' +
+              '<div class="cmd-meta">' +
+              '<div class="cmd-title">' +
+              esc(cmd.label) +
+              '</div>' +
+              '<div class="cmd-desc">' +
+              esc(cmd.desc) +
+              '</div>' +
+              '</div>' +
+              '<span class="cmd-hint">' +
+              esc(cmd.hint) +
+              '</span>';
+
+            row.addEventListener('mousedown', function (e) {
+              e.preventDefault();
+              applyCommand(cmd);
+            });
+            row.addEventListener('mouseenter', function () {
+              cmdSelected = idx;
+              updateCmdSelection();
+            });
+            cmdMenu.appendChild(row);
+          });
+        }
+
+        function updateCmdSelection() {
+          var items = cmdMenu.querySelectorAll('.cmd-item');
+          items.forEach(function (el, idx) {
+            el.classList.toggle('selected', idx === cmdSelected);
+            if (idx === cmdSelected) {
+              el.scrollIntoView({ block: 'nearest' });
+            }
+          });
+        }
+
+        function positionCmdMenu(blockEl) {
+          var rect = blockEl.getBoundingClientRect();
+          var top = rect.bottom + 6;
+          if (top + 310 > window.innerHeight) {
+            top = Math.max(12, rect.top - 310);
+          }
+          cmdMenu.style.top = top + 'px';
+          cmdMenu.style.left = Math.max(16, rect.left) + 'px';
+        }
+
+        function checkCommandTrigger() {
+          if (activeIdx < 0 || !editor.children[activeIdx]) {
+            closeCmdMenu();
+            return;
+          }
+          var el = editor.children[activeIdx];
+          var text = getPlainText(el);
+
+          var slashMatch = text.match(/^\/([a-zA-Z0-9-]*)$/);
+          if (slashMatch) {
+            var query = slashMatch[1].toLowerCase();
+            cmdMatches = COMMANDS.filter(function (c) {
+              return (
+                c.label.toLowerCase().indexOf(query) >= 0 ||
+                c.id.indexOf(query) >= 0 ||
+                c.hint.toLowerCase().indexOf(query) >= 0
+              );
+            });
+            if (cmdMatches.length > 0) {
+              cmdOpen = true;
+              cmdSelected = 0;
+              cmdMenu.hidden = false;
+              renderCmdMenu();
+              positionCmdMenu(el);
+              return;
+            }
+          }
+
+          if (text === '-' || text === '>') {
+            cmdMatches = COMMANDS.filter(function (c) {
+              return text === '-'
+                ? c.id === 'bullet' || c.id === 'todo' || c.id === 'divider'
+                : c.id === 'quote';
+            });
+            cmdOpen = true;
+            cmdSelected = 0;
+            cmdMenu.hidden = false;
+            renderCmdMenu();
+            positionCmdMenu(el);
+            return;
+          }
+
+          closeCmdMenu();
+        }
+
+        function applyCommand(cmd) {
+          if (activeIdx < 0 || !editor.children[activeIdx]) return;
+          var el = editor.children[activeIdx];
+          closeCmdMenu();
+
+          if (cmd.id === 'subpage') {
+            createSubpage(activePageId, true);
+            return;
+          }
+
+          if (cmd.id === 'code') {
+            var blocks = parseBlocks(currentPage().content);
+            var lines = currentPage().content.split('\n');
+            var startLine = blocks[activeIdx] ? blocks[activeIdx].startLine : 0;
+            lines.splice(startLine, 1, '```', '', '```');
+            currentPage().content = lines.join('\n');
+            saveState();
+            renderAll(activeIdx, 4);
+            return;
+          }
+
+          if (cmd.id === 'divider') {
+            var blocks = parseBlocks(currentPage().content);
+            var lines = currentPage().content.split('\n');
+            var startLine = blocks[activeIdx] ? blocks[activeIdx].startLine : 0;
+            lines.splice(startLine, 1, '---', '');
+            currentPage().content = lines.join('\n');
+            saveState();
+            renderAll(activeIdx + 1, 0);
+            return;
+          }
+
+          if (cmd.wrap) {
+            var full = cmd.wrap[0] + cmd.wrap[1];
+            setPlainText(el, full);
+            el.dataset.raw = full;
+            setCaretOffset(el, cmd.wrap[0].length);
+            syncFromDOM();
+            return;
+          }
+
+          setPlainText(el, cmd.syntax);
+          el.dataset.raw = cmd.syntax;
+          setCaretOffset(el, cmd.syntax.length);
+          syncFromDOM();
+        }
+
+        /* --- Editor Interactions & Keyboard Handling --- */
+
+        loadState();
+        pageTitleEl.value = currentPage().title;
+        renderSidebar();
+        renderBreadcrumbs();
+        renderAll(currentPage().content ? -1 : 0, 0);
+
+        editor.addEventListener('mousedown', function (e) {
+          // Click embedded YouTube thumbnail -> load playable iframe inline
+          var ytCard = e.target.closest('.embed-video-card');
+          if (ytCard && !e.target.closest('a')) {
+            e.preventDefault();
+            var ytId = ytCard.dataset.yt;
+            ytCard.outerHTML =
+              '<div class="embed-iframe-wrap">' +
+              '<iframe src="[https://www.youtube.com/embed/](https://www.youtube.com/embed/)' +
+              esc(ytId) +
+              '?autoplay=1" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen></iframe>' +
+              '</div>';
+            return;
+          }
+
+          // Click embedded subpage card -> navigate into subpage
+          var subCard = e.target.closest('.subpage-card');
+          if (subCard) {
+            e.preventDefault();
+            var subId = subCard.dataset.subpageId;
+            if (pages.some(function (p) { return p.id === subId; })) {
+              switchPage(subId);
+            }
+            return;
+          }
+
+          if (e.target.closest('a') || e.target.closest('video')) return;
+
+          if (e.target.matches('input[type="checkbox"][data-line]')) {
+            e.preventDefault();
+            var ln = Number(e.target.dataset.line);
+            var lines = currentPage().content.split('\n');
+            if (lines[ln] != null) {
+              lines[ln] = lines[ln].replace(
+                /^(\s*(?:[-*+]|\d+[.)])\s+)\[( |x|X)\]/,
+                function (_, pre, c) {
+                  return pre + (c === ' ' ? '[x]' : '[ ]');
+                }
+              );
+              currentPage().content = lines.join('\n');
+              saveState();
+              renderAll(
+                activeIdx,
+                activeIdx >= 0 ? getCaretOffset(editor.children[activeIdx]) : 0
+              );
+            }
+            return;
+          }
+
+          var blockEl = e.target.closest('.block');
+          if (blockEl) {
+            var idx = Number(blockEl.dataset.idx);
+            if (idx !== activeIdx) {
+              e.preventDefault();
+              editor.focus();
+              activateBlock(idx, e);
+            }
+          }
+        });
+
+        document.getElementById('mainCanvas').addEventListener('mousedown', function (e) {
+          if (e.target.id === 'mainCanvas' || e.target === editor) {
+            e.preventDefault();
+            editor.focus();
+            var blocks = parseBlocks(currentPage().content);
+            var lastIdx = blocks.length - 1;
+            if (blocks[lastIdx].raw !== '') {
+              currentPage().content += '\n';
+              saveState();
+              lastIdx++;
+            }
+            renderAll(lastIdx, 0);
+          }
+        });
+
+        document.addEventListener('selectionchange', function () {
+          if (document.activeElement !== editor) {
+            hideSelectionToolbar();
+            return;
+          }
+          var sel = window.getSelection();
+          if (!sel.rangeCount) return;
+          var node = sel.anchorNode;
+          var blockEl =
+            node.nodeType === 1 ? node.closest('.block') : node.parentElement.closest('.block');
+          if (blockEl) {
+            var idx = Number(blockEl.dataset.idx);
+            if (idx !== activeIdx) {
+              closeCmdMenu();
+              hideSelectionToolbar();
+              var offset = getCaretOffset(blockEl);
+              syncFromDOM();
+              renderAll(idx, offset);
+              return;
+            }
+          }
+          updateSelectionToolbar();
+        });
+
+        editor.addEventListener('blur', function () {
+          setTimeout(function () {
+            if (document.activeElement !== editor) {
+              closeCmdMenu();
+              hideSelectionToolbar();
+              if (activeIdx >= 0) {
+                syncFromDOM();
+                renderAll(-1);
+              }
+            }
+          }, 150);
+        });
+
+        editor.addEventListener('input', function () {
+          if (activeIdx >= 0 && editor.children[activeIdx]) {
+            var rawNow = getPlainText(editor.children[activeIdx]);
+            editor.children[activeIdx].dataset.raw = rawNow;
+
+            // Instant divider conversion when user types "--- "
+            if (/^---\s$/.test(rawNow)) {
+              var blocks = parseBlocks(currentPage().content);
+              var lines = currentPage().content.split('\n');
+              var startLine = blocks[activeIdx].startLine;
+              lines.splice(startLine, 1, '---', '');
+              currentPage().content = lines.join('\n');
+              saveState();
+              renderAll(activeIdx + 1, 0);
+              return;
+            }
+          }
+          syncFromDOM();
+          checkCommandTrigger();
+        });
+
+        editor.addEventListener('paste', function (e) {
+          e.preventDefault();
+          var text = (e.clipboardData || window.clipboardData).getData('text/plain');
+          if (!text || activeIdx < 0) return;
+
+          var el = editor.children[activeIdx];
+          var cur = getPlainText(el);
+          var offset = getCaretOffset(el);
+          var updated = cur.slice(0, offset) + text + cur.slice(offset);
+          el.dataset.raw = updated;
+          syncFromDOM();
+
+          var newBlocks = parseBlocks(currentPage().content);
+          var targetIdx = Math.min(activeIdx + text.split('\n').length - 1, newBlocks.length - 1);
+          renderAll(targetIdx, newBlocks[targetIdx].raw.length);
+        });
+
+        var RE_LISTLINE = /^(\s*)(?:([-*+])|(\d{1,9})([.)]))\s+(\[[ xX]\]\s+)?(.*)$/;
+
+        editor.addEventListener('keydown', function (e) {
+          if (cmdOpen) {
+            if (e.key === 'ArrowDown') {
+              e.preventDefault();
+              cmdSelected = (cmdSelected + 1) % cmdMatches.length;
+              updateCmdSelection();
+              return;
+            }
+            if (e.key === 'ArrowUp') {
+              e.preventDefault();
+              cmdSelected = (cmdSelected - 1 + cmdMatches.length) % cmdMatches.length;
+              updateCmdSelection();
+              return;
+            }
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              applyCommand(cmdMatches[cmdSelected]);
+              return;
+            }
+            if (e.key === 'Escape') {
+              e.preventDefault();
+              closeCmdMenu();
+              return;
+            }
+          }
+
+          if (e.key === 'Escape') {
+            help.hidden = true;
+            hideSelectionToolbar();
+            return;
+          }
+
+          if (activeIdx < 0 || !editor.children[activeIdx]) return;
+          var el = editor.children[activeIdx];
+          var v = getPlainText(el);
+          var offset = getCaretOffset(el);
+          var isFenceBlock = RE_FENCE.test(v);
+
+          // Tab / Shift+Tab indentation
+          if (e.key === 'Tab' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+            e.preventDefault();
+            var lineStart = v.lastIndexOf('\n', offset - 1) + 1;
+            if (e.shiftKey) {
+              var before = v.slice(lineStart);
+              var trimmed = before.replace(/^( {1,2}|\t)/, '');
+              var diff = before.length - trimmed.length;
+              var next = v.slice(0, lineStart) + trimmed;
+              setPlainText(el, next);
+              setCaretOffset(el, Math.max(lineStart, offset - diff));
+            } else {
+              var next = v.slice(0, offset) + '  ' + v.slice(offset);
+              setPlainText(el, next);
+              setCaretOffset(el, offset + 2);
+            }
+            el.dataset.raw = getPlainText(el);
+            syncFromDOM();
+            return;
+          }
+
+          // Enter handling (Code blocks, Lists, and Standard blocks)
+          if (e.key === 'Enter' && !e.isComposing) {
+            // Inside a fenced code block
+            if (isFenceBlock) {
+              var fenceLines = v.split('\n');
+              var lastLine = fenceLines[fenceLines.length - 1];
+              var hasClosingFence = fenceLines.length > 1 && RE_FENCE.test(lastLine);
+
+              // If cursor is at the very end after closing ```, exit code block into a new paragraph
+              if (hasClosingFence && offset === v.length) {
+                e.preventDefault();
+                var blocks = parseBlocks(currentPage().content);
+                var lines = currentPage().content.split('\n');
+                var curBlock = blocks[activeIdx];
+                lines.splice(curBlock.startLine + fenceLines.length, 0, '');
+                currentPage().content = lines.join('\n');
+                saveState();
+                renderAll(activeIdx + 1, 0);
+                return;
+              }
+
+              // If user just typed ``` on a single line and pressed Enter, auto-close the fence
+              if (fenceLines.length === 1 && offset === v.length) {
+                e.preventDefault();
+                var blocks = parseBlocks(currentPage().content);
+                var lines = currentPage().content.split('\n');
+                lines.splice(blocks[activeIdx].startLine, 1, v, '', '```');
+                currentPage().content = lines.join('\n');
+                saveState();
+                renderAll(activeIdx, v.length + 1);
+                return;
+              }
+
+              // Otherwise insert a newline inside the code block
+              e.preventDefault();
+              var nextCode = v.slice(0, offset) + '\n' + v.slice(offset);
+              setPlainText(el, nextCode);
+              setCaretOffset(el, offset + 1);
+              el.dataset.raw = nextCode;
+              syncFromDOM();
+              return;
+            }
+
+            if (e.shiftKey) {
+              e.preventDefault();
+              var next = v.slice(0, offset) + '\n' + v.slice(offset);
+              setPlainText(el, next);
+              setCaretOffset(el, offset + 1);
+              el.dataset.raw = getPlainText(el);
+              syncFromDOM();
+              return;
+            }
+
+            e.preventDefault();
+            var before = v.slice(0, offset);
+            var after = v.slice(offset);
+
+            // Auto-continue lists
+            var m = before.match(RE_LISTLINE);
+            if (m && after === '') {
+              if (m[6] === '') {
+                setPlainText(el, '');
+                el.dataset.raw = '';
+                syncFromDOM();
+                renderAll(activeIdx, 0);
+                return;
+              }
+              var marker = m[2] || parseInt(m[3], 10) + 1 + m[4];
+              var prefix = m[1] + marker + ' ' + (m[5] ? '[ ] ' : '');
+              el.dataset.raw = before;
+              syncFromDOM();
+
+              var blocks = parseBlocks(currentPage().content);
+              var lines = currentPage().content.split('\n');
+              var insertLine =
+                blocks[activeIdx].startLine + blocks[activeIdx].raw.split('\n').length;
+              lines.splice(insertLine, 0, prefix);
+              currentPage().content = lines.join('\n');
+              saveState();
+              renderAll(activeIdx + 1, prefix.length);
+              return;
+            }
+
+            // Standard Enter split
+            var blocks = parseBlocks(currentPage().content);
+            var lines = currentPage().content.split('\n');
+            var curBlock = blocks[activeIdx];
+            var blockLineCount = curBlock.raw.split('\n').length;
+
+            lines.splice(curBlock.startLine, blockLineCount, before, after);
+            currentPage().content = lines.join('\n');
+            saveState();
+            renderAll(activeIdx + 1, 0);
+            return;
+          }
+
+          // Backspace at start of block merges with previous block
+          if (e.key === 'Backspace' && offset === 0 && activeIdx > 0) {
+            var sel = window.getSelection();
+            if (sel.isCollapsed) {
+              e.preventDefault();
+              var blocks = parseBlocks(currentPage().content);
+              var prevRaw = blocks[activeIdx - 1].raw;
+              var curRaw = v;
+              var joinPos = prevRaw.length;
+
+              blocks[activeIdx - 1].raw = prevRaw + curRaw;
+              blocks.splice(activeIdx, 1);
+              currentPage().content = blocks
+                .map(function (b) {
+                  return b.raw;
+                })
+                .join('\n');
+              saveState();
+              renderAll(activeIdx - 1, joinPos);
+            }
+          }
+        });
+
+        // Cross-tab synchronization
+        function reloadDoc() {
+          var lsTime = Number(localStorage.getItem(LS_TIME));
+          if (lsTime > lastSave) {
+            lastSave = lsTime;
+            loadState();
+            pageTitleEl.value = currentPage().title;
+            renderSidebar();
+            renderBreadcrumbs();
+            renderAll(-1);
+          }
+        }
+        setInterval(reloadDoc, 1000);
+
+        document.getElementById('helpBtn').addEventListener('click', function (e) {
+          e.stopPropagation();
+          help.hidden = !help.hidden;
+        });
+
+        document.addEventListener('keydown', function (e) {
+          if (e.key === 'Escape') {
+            help.hidden = true;
+            closeCmdMenu();
+            hideSelectionToolbar();
+          }
+        });
+
+        if ('serviceWorker' in navigator) {
+          navigator.serviceWorker.register('./sw.js').catch(function (e) {
+            console.error(e);
+          });
+        }
+      }
+    </script>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #111111;
+        --sidebar-bg: #161616;
+        --fg: #ffffff;
+        --text: #e6e6e6;
+        --dim: #7a7a7a;
+        --line: #262626;
+        --raise: #1d1d1d;
+        --hover: #222222;
+        --accent: #74c0fc;
+        --font-edit: Menlo, Consolas, Monaco, Liberation Mono, Lucida Console, monospace;
+        --font-view: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        background-color: var(--bg);
+        color: var(--text);
+        font-family: var(--font-view);
+        overflow: hidden;
+      }
+
+      .app-shell {
+        display: flex;
+        width: 100%;
+        height: 100%;
+      }
+
+      /* Notion-style Left Sidebar */
+      #sidebar {
+        width: 245px;
+        flex-shrink: 0;
+        background: var(--sidebar-bg);
+        border-right: 1px solid var(--line);
+        display: flex;
+        flex-direction: column;
+        transition: width 0.18s ease;
+        user-select: none;
+      }
+
+      #sidebar.collapsed {
+        width: 0;
+        overflow: hidden;
+        border-right: 0;
+      }
+
+      .sidebar-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.9rem 0.85rem;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 0.55rem;
+        font-weight: 600;
+        font-size: 0.92rem;
+        color: var(--fg);
+      }
+
+      .brand img {
+        width: 22px;
+        height: 22px;
+        border-radius: 4px;
+        object-fit: cover;
+        background: var(--raise);
+      }
+
+      .sidebar-section-label {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.85rem 0.85rem 0.35rem;
+        font-size: 0.72rem;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        color: var(--dim);
+      }
+
+      #newPageBtn {
+        background: transparent;
+        border: 0;
+        color: var(--dim);
+        font-size: 1.1rem;
+        line-height: 1;
+        padding: 0.15rem 0.35rem;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      #newPageBtn:hover {
+        background: var(--hover);
+        color: var(--fg);
+      }
+
+      #pageList {
+        flex: 1;
+        overflow-y: auto;
+        padding: 0.25rem 0.5rem;
+      }
+
+      .page-item {
+        display: flex;
+        align-items: center;
+        gap: 0.25rem;
+        padding: 0.38rem 0.5rem;
+        border-radius: 5px;
+        font-size: 0.86rem;
+        color: #b5b5b5;
+        cursor: pointer;
+        margin-bottom: 2px;
+      }
+
+      .page-item:hover {
+        background: var(--hover);
+        color: var(--fg);
+      }
+
+      .page-item.active {
+        background: #242424;
+        color: var(--fg);
+        font-weight: 500;
+      }
+
+      .tree-toggle {
+        width: 16px;
+        text-align: center;
+        font-size: 0.72rem;
+        color: var(--dim);
+        flex-shrink: 0;
+        border-radius: 3px;
+      }
+      .tree-toggle:not(.empty):hover {
+        background: #333;
+        color: var(--fg);
+      }
+      .tree-toggle.empty {
+        opacity: 0.35;
+        cursor: default;
+      }
+
+      .page-name {
+        flex: 1;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .page-name::before {
+        content: '📄 ';
+        font-size: 0.78rem;
+        opacity: 0.75;
+      }
+
+      .page-actions {
+        display: flex;
+        gap: 2px;
+        opacity: 0;
+        transition: opacity 0.12s;
+      }
+
+      .page-item:hover .page-actions {
+        opacity: 1;
+      }
+
+      .icon-btn {
+        background: transparent;
+        border: 0;
+        color: var(--dim);
+        font-size: 0.82rem;
+        padding: 0.1rem 0.28rem;
+        border-radius: 3px;
+        cursor: pointer;
+      }
+      .icon-btn:hover {
+        background: #333;
+        color: var(--fg);
+      }
+      .icon-btn.del:hover {
+        color: #ff6b6b;
+      }
+
+      .rename-input {
+        width: 100%;
+        background: var(--bg);
+        color: var(--fg);
+        border: 1px solid var(--accent);
+        border-radius: 3px;
+        padding: 0.15rem 0.35rem;
+        font: inherit;
+        outline: none;
+      }
+
+      /* Sidebar Toggle */
+      #sidebarToggle {
+        position: fixed;
+        top: 0.85rem;
+        left: 0.85rem;
+        z-index: 20;
+        width: 28px;
+        height: 28px;
+        border-radius: 5px;
+        border: 1px solid var(--line);
+        background: var(--raise);
+        color: var(--dim);
+        display: grid;
+        place-items: center;
+        cursor: pointer;
+        font-size: 13px;
+      }
+      #sidebarToggle:hover {
+        color: var(--fg);
+        border-color: #444;
+      }
+      #sidebar:not(.collapsed) ~ #mainCanvas #sidebarToggle {
+        left: 257px;
+      }
+
+      /* Main Document Canvas */
+      #mainCanvas {
+        flex: 1;
+        height: 100%;
+        overflow-y: auto;
+        position: relative;
+      }
+
+      .doc-container {
+        max-width: 740px;
+        margin: 0 auto;
+        padding: 3.5rem 2rem 8rem;
+      }
+
+      /* Breadcrumbs for Subpages */
+      #breadcrumbs {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 0.35rem;
+        margin-bottom: 0.75rem;
+        font-size: 0.82rem;
+        color: var(--dim);
+      }
+      #breadcrumbs[hidden] {
+        display: none;
+      }
+      .crumb-btn {
+        background: transparent;
+        border: 0;
+        color: var(--dim);
+        font: inherit;
+        padding: 0.15rem 0.35rem;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      .crumb-btn:hover {
+        background: var(--hover);
+        color: var(--fg);
+      }
+      .crumb-btn.current {
+        color: var(--text);
+        font-weight: 500;
+      }
+
+      #pageTitle {
+        width: 100%;
+        background: transparent;
+        border: 0;
+        color: var(--fg);
+        font-family: var(--font-view);
+        font-size: 2.25rem;
+        font-weight: 700;
+        line-height: 1.2;
+        margin-bottom: 1.25rem;
+        padding: 0;
+        outline: none;
+      }
+      #pageTitle::placeholder {
+        color: #3a3a3a;
+      }
+
+      #editor {
+        min-height: 65vh;
+        font-size: 1.06rem;
+        line-height: 1.65;
+        outline: none;
+        cursor: text;
+      }
+
+      .block {
+        min-height: 1.65em;
+        border-radius: 4px;
+        word-wrap: break-word;
+      }
+
+      .block.editing {
+        font-family: var(--font-edit);
+        font-size: 0.96rem;
+        color: var(--fg);
+        background: rgba(255, 255, 255, 0.035);
+        padding: 0.15rem 0.45rem;
+        margin: 0 -0.45rem;
+        white-space: pre-wrap;
+      }
+
+      .block.editing:empty::before {
+        content: "Type '/' for commands, or select text to color/highlight...";
+        color: #4a4a4a;
+        font-family: var(--font-view);
+        pointer-events: none;
+      }
+
+      /* Rendered Block Typography */
+      .block p {
+        margin: 0.25em 0;
+      }
+      .md-empty {
+        height: 1.1em;
+      }
+      .block h1,
+      .block h2,
+      .block h3,
+      .block h4,
+      .block h5,
+      .block h6 {
+        color: var(--fg);
+        line-height: 1.25;
+        margin: 0.95em 0 0.25em;
+        font-weight: 650;
+      }
+      .block h1 {
+        font-size: 1.85em;
+        padding-bottom: 0.2em;
+        border-bottom: 1px solid var(--line);
+      }
+      .block h2 {
+        font-size: 1.48em;
+        padding-bottom: 0.2em;
+        border-bottom: 1px solid var(--line);
+      }
+      .block h3 {
+        font-size: 1.24em;
+      }
+      .block h4 {
+        font-size: 1.08em;
+      }
+      .block h5,
+      .block h6 {
+        font-size: 1em;
+        color: var(--dim);
+      }
+
+      /* Divider */
+      .hr-block {
+        padding: 0.65rem 0;
+        cursor: pointer;
+      }
+      .hr-block hr {
+        border: 0;
+        border-top: 1px solid #353535;
+        margin: 0;
+      }
+      .hr-block:hover hr {
+        border-top-color: #555;
+      }
+
+      .block a {
+        color: var(--accent);
+        text-decoration: underline;
+        text-decoration-color: #74c0fc55;
+        text-underline-offset: 0.15em;
+      }
+
+      /* Code Blocks */
+      .code-wrap {
+        position: relative;
+        margin: 0.55em 0;
+      }
+      .code-lang {
+        position: absolute;
+        top: 0.45rem;
+        right: 0.75rem;
+        font-family: var(--font-edit);
+        font-size: 0.7rem;
+        color: var(--dim);
+        text-transform: uppercase;
+        pointer-events: none;
+      }
+      .block code,
+      .block pre {
+        font-family: var(--font-edit);
+      }
+      .block code {
+        background: var(--raise);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 0.08em 0.35em;
+        font-size: 0.86em;
+      }
+      .block pre {
+        background: var(--raise);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 0.85rem 1rem;
+        overflow-x: auto;
+        line-height: 1.5;
+        margin: 0;
+        min-height: 2.6rem;
+      }
+      .block pre code {
+        background: none;
+        border: 0;
+        padding: 0;
+        font-size: 0.92rem;
+        white-space: pre;
+      }
+
+      .block blockquote {
+        margin: 0.35em 0;
+        padding: 0.15rem 1rem;
+        border-left: 3px solid #444;
+        color: #b0b0b0;
+      }
+      .block mark {
+        background: rgba(255, 212, 59, 0.32);
+        color: inherit;
+        border-radius: 3px;
+        padding: 0.05em 0.22em;
+      }
+      .block del {
+        color: var(--dim);
+      }
+
+      /* Embedded Subpage Card inside Note */
+      .subpage-card {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.55rem;
+        padding: 0.45rem 0.75rem;
+        margin: 0.25rem 0;
+        background: var(--raise);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        color: var(--fg);
+        font-size: 0.94rem;
+        font-weight: 500;
+        cursor: pointer;
+        transition: background 0.12s, border-color 0.12s;
+      }
+      .subpage-card:hover {
+        background: #252525;
+        border-color: #444;
+      }
+      .subpage-title {
+        text-decoration: underline;
+        text-decoration-color: #444;
+        text-underline-offset: 0.18em;
+      }
+      .subpage-arrow {
+        color: var(--dim);
+        font-size: 0.8rem;
+      }
+
+      /* Embedded Media & Link Cards */
+      .embed-media {
+        margin: 0.6rem 0;
+        border-radius: 8px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        background: var(--raise);
+        display: inline-block;
+        max-width: 100%;
+      }
+      .embed-media img,
+      .embed-media video {
+        display: block;
+        max-width: 100%;
+        max-height: 440px;
+        object-fit: contain;
+      }
+      .embed-caption {
+        padding: 0.4rem 0.7rem;
+        font-size: 0.8rem;
+        color: var(--dim);
+        border-top: 1px solid var(--line);
+      }
+
+      .embed-video-card {
+        position: relative;
+        margin: 0.6rem 0;
+        max-width: 520px;
+        border-radius: 8px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        background: #000;
+        cursor: pointer;
+      }
+      .embed-video-card img {
+        display: block;
+        width: 100%;
+        aspect-ratio: 16 / 9;
+        object-fit: cover;
+        opacity: 0.88;
+        transition: opacity 0.15s;
+      }
+      .embed-video-card:hover img {
+        opacity: 1;
+      }
+      .embed-play-badge {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        background: rgba(17, 17, 17, 0.85);
+        color: #fff;
+        border: 1px solid #444;
+        padding: 0.5rem 0.95rem;
+        border-radius: 999px;
+        font-size: 0.85rem;
+        font-weight: 600;
+        pointer-events: none;
+      }
+      .embed-ext-link {
+        display: block;
+        padding: 0.45rem 0.75rem;
+        background: var(--raise);
+        font-size: 0.8rem;
+        border-top: 1px solid var(--line);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .embed-iframe-wrap {
+        position: relative;
+        width: 100%;
+        max-width: 640px;
+        aspect-ratio: 16 / 9;
+        margin: 0.6rem 0;
+        border-radius: 8px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+      }
+      .embed-iframe-wrap iframe {
+        width: 100%;
+        height: 100%;
+      }
+
+      .embed-bookmark {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin: 0.5rem 0;
+        padding: 0.7rem 0.9rem;
+        background: var(--raise);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        text-decoration: none !important;
+        transition: background 0.15s, border-color 0.15s;
+      }
+      .embed-bookmark:hover {
+        background: #232323;
+        border-color: #3d3d3d;
+      }
+      .bookmark-info {
+        min-width: 0;
+        flex: 1;
+      }
+      .bookmark-title {
+        font-size: 0.92rem;
+        font-weight: 600;
+        color: var(--fg);
+        margin-bottom: 0.2rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .bookmark-url {
+        font-size: 0.76rem;
+        color: var(--dim);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        margin-bottom: 0.35rem;
+      }
+      .bookmark-domain {
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+        font-size: 0.76rem;
+        color: #b0b0b0;
+      }
+      .bookmark-domain img {
+        width: 14px;
+        height: 14px;
+        border-radius: 2px;
+      }
+
+      /* Lists & Checklists */
+      .md-li {
+        position: relative;
+        margin: 0.18em 0;
+      }
+      .md-bullet {
+        position: absolute;
+        left: 0.45rem;
+        color: var(--dim);
+        user-select: none;
+      }
+      .md-li.task.done > span {
+        color: var(--dim);
+        text-decoration: line-through;
+      }
+      .md-li input[type='checkbox'] {
+        -webkit-appearance: none;
+        appearance: none;
+        position: absolute;
+        left: 0.25rem;
+        top: 0.36em;
+        width: 1em;
+        height: 1em;
+        margin: 0;
+        border: 1.5px solid #555;
+        border-radius: 4px;
+        background: transparent;
+        cursor: pointer;
+      }
+      .md-li input[type='checkbox']:checked {
+        background: var(--accent);
+        border-color: var(--accent);
+      }
+      .md-li input[type='checkbox']:checked::after {
+        content: '';
+        display: block;
+        width: 0.28em;
+        height: 0.52em;
+        border: solid var(--bg);
+        border-width: 0 2px 2px 0;
+        transform: translate(0.27em, 0.02em) rotate(45deg);
+      }
+
+      /* Floating Text Selection Toolbar */
+      #selToolbar {
+        position: fixed;
+        z-index: 60;
+        display: flex;
+        align-items: center;
+        gap: 2px;
+        background: #1f1f1f;
+        border: 1px solid #353535;
+        border-radius: 7px;
+        padding: 0.25rem 0.35rem;
+        box-shadow: 0 10px 28px rgba(0, 0, 0, 0.6);
+      }
+      #selToolbar[hidden] {
+        display: none;
+      }
+      .tb-btn {
+        background: transparent;
+        border: 0;
+        color: var(--text);
+        font-family: var(--font-view);
+        font-size: 0.8rem;
+        padding: 0.28rem 0.48rem;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      .tb-btn:hover {
+        background: #2f2f2f;
+        color: var(--fg);
+      }
+      .tb-sep {
+        width: 1px;
+        height: 16px;
+        background: #333;
+        margin: 0 0.2rem;
+      }
+      .tb-dot {
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        cursor: pointer;
+        margin: 0 2px;
+        padding: 0;
+      }
+      .tb-dot:hover {
+        transform: scale(1.15);
+      }
+
+      /* Notion-style Command Popup Menu */
+      #cmdMenu {
+        position: fixed;
+        z-index: 50;
+        width: 300px;
+        max-height: 310px;
+        overflow-y: auto;
+        background: #1c1c1c;
+        border: 1px solid #303030;
+        border-radius: 8px;
+        padding: 0.35rem;
+        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+      }
+      #cmdMenu[hidden] {
+        display: none;
+      }
+      .cmd-header {
+        font-size: 0.68rem;
+        font-weight: 600;
+        letter-spacing: 0.05em;
+        color: var(--dim);
+        padding: 0.3rem 0.55rem;
+      }
+      .cmd-item {
+        display: flex;
+        align-items: center;
+        gap: 0.65rem;
+        padding: 0.45rem 0.55rem;
+        border-radius: 5px;
+        cursor: pointer;
+      }
+      .cmd-item.selected {
+        background: #2a2a2a;
+      }
+      .cmd-icon {
+        width: 28px;
+        height: 28px;
+        border-radius: 5px;
+        background: #252525;
+        border: 1px solid #333;
+        display: grid;
+        place-items: center;
+        font-family: var(--font-edit);
+        font-size: 0.78rem;
+        color: var(--fg);
+        flex-shrink: 0;
+      }
+      .cmd-meta {
+        flex: 1;
+        min-width: 0;
+      }
+      .cmd-title {
+        font-size: 0.85rem;
+        font-weight: 500;
+        color: var(--fg);
+      }
+      .cmd-desc {
+        font-size: 0.72rem;
+        color: var(--dim);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .cmd-hint {
+        font-family: var(--font-edit);
+        font-size: 0.7rem;
+        color: var(--dim);
+      }
+
+      /* Floating Help Button & Rich Visual Guide */
+      #helpBtn {
+        position: fixed;
+        right: 1.25rem;
+        bottom: 1.25rem;
+        z-index: 30;
+        width: 30px;
+        height: 30px;
+        border-radius: 50%;
+        border: 1px solid #333;
+        background: var(--raise);
+        color: #bbb;
+        font: 600 13px/1 var(--font-view);
+        display: grid;
+        place-items: center;
+        cursor: pointer;
+        transition: all 0.15s;
+      }
+      #helpBtn:hover {
+        color: var(--fg);
+        border-color: var(--accent);
+        background: #252525;
+      }
+
+      #help {
+        position: fixed;
+        right: 1.25rem;
+        bottom: 3.6rem;
+        z-index: 40;
+        width: 370px;
+        max-width: calc(100vw - 2.5rem);
+        max-height: 78vh;
+        overflow-y: auto;
+        background: #191919;
+        border: 1px solid #303030;
+        border-radius: 10px;
+        padding: 1rem 1.15rem;
+        font-size: 0.84rem;
+        line-height: 1.5;
+        color: var(--text);
+        box-shadow: 0 14px 36px rgba(0, 0, 0, 0.65);
+      }
+      #help[hidden] {
+        display: none;
+      }
+
+      .help-title {
+        font-size: 0.75rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--dim);
+        margin-bottom: 0.65rem;
+      }
+
+      .help-grid {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+      }
+
+      .help-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.75rem;
+        padding-bottom: 0.45rem;
+        border-bottom: 1px solid #232323;
+      }
+      .help-row:last-child {
+        border-bottom: 0;
+        padding-bottom: 0;
+      }
+
+      .help-syntax {
+        font-family: var(--font-edit);
+        font-size: 0.75rem;
+        color: #9e9e9e;
+        background: #121212;
+        padding: 0.18rem 0.42rem;
+        border-radius: 4px;
+        border: 1px solid #262626;
+      }
+
+      .help-preview {
+        text-align: right;
+      }
+      .help-h1 {
+        font-size: 1.15rem;
+        font-weight: 700;
+        color: var(--fg);
+      }
+      .help-h2 {
+        font-size: 0.98rem;
+        font-weight: 650;
+        color: var(--fg);
+      }
+      .help-code-inline {
+        font-family: var(--font-edit);
+        font-size: 0.78rem;
+        background: #242424;
+        border: 1px solid #333;
+        padding: 0.1rem 0.35rem;
+        border-radius: 4px;
+      }
+      .help-code-block {
+        font-family: var(--font-edit);
+        font-size: 0.75rem;
+        background: #121212;
+        border: 1px solid #2b2b2b;
+        border-radius: 5px;
+        padding: 0.35rem 0.55rem;
+        margin-top: 0.35rem;
+        color: #a5d8ff;
+      }
+      .help-quote {
+        border-left: 3px solid #555;
+        padding-left: 0.55rem;
+        color: #aaa;
+      }
+      .help-mark {
+        background: rgba(255, 212, 59, 0.32);
+        padding: 0.05rem 0.3rem;
+        border-radius: 3px;
+      }
+      .help-mark-blue {
+        background: color-mix(in srgb, #74c0fc 35%, transparent);
+        padding: 0.05rem 0.3rem;
+        border-radius: 3px;
+      }
+      .swatch-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.35rem;
+        margin-top: 0.35rem;
+        font-size: 0.76rem;
+        font-weight: 500;
+      }
+    </style>
+  </head>
+
+  <body onload="init()">
+    <div class="app-shell">
+      <!-- Left Sidebar -->
+      <aside id="sidebar">
+        <div class="sidebar-header">
+          <div class="brand">
+            <img src="./logo.png" alt="Logo" onerror="this.style.display='none'" />
+            <span>Notes</span>
+          </div>
+        </div>
+
+        <div class="sidebar-section-label">
+          <span>PAGES</span>
+          <button type="button" id="newPageBtn" title="New root page">+</button>
+        </div>
+
+        <div id="pageList"></div>
+      </aside>
+
+      <!-- Main Notion-like Editor -->
+      <div id="mainCanvas">
+        <button type="button" id="sidebarToggle" title="Toggle sidebar">☰</button>
+
+        <div class="doc-container">
+          <nav id="breadcrumbs" hidden></nav>
+          <input
+            type="text"
+            id="pageTitle"
+            placeholder="Untitled"
+            autocomplete="off"
+          />
+          <main id="editor" contenteditable="true" spellcheck="true"></main>
+        </div>
+      </div>
+    </div>
+
+    <!-- Floating Text Selection Toolbar -->
+    <div id="selToolbar" hidden>
+      <button type="button" class="tb-btn" data-wrap-pre="**" data-wrap-suf="**" title="Bold"><strong>B</strong></button>
+      <button type="button" class="tb-btn" data-wrap-pre="*" data-wrap-suf="*" title="Italic"><em>I</em></button>
+      <button type="button" class="tb-btn" data-wrap-pre="~~" data-wrap-suf="~~" title="Strikethrough"><del>S</del></button>
+      <button type="button" class="tb-btn" data-wrap-pre="`" data-wrap-suf="`" title="Inline code"><code>&lt;/&gt;</code></button>
+      <span class="tb-sep"></span>
+      <button type="button" class="tb-btn" data-wrap-pre="==" data-wrap-suf="==" title="Yellow highlight" style="background:rgba(255,212,59,0.28)">H</button>
+      <button type="button" class="tb-btn" data-wrap-pre="=={blue|" data-wrap-suf="}==" title="Blue highlight" style="background:rgba(116,192,252,0.28)">H</button>
+      <span class="tb-sep"></span>
+      <button type="button" class="tb-dot" data-wrap-pre="{red|" data-wrap-suf="}" title="Red text" style="background:#ff6b6b"></button>
+      <button type="button" class="tb-dot" data-wrap-pre="{orange|" data-wrap-suf="}" title="Orange text" style="background:#ffa94d"></button>
+      <button type="button" class="tb-dot" data-wrap-pre="{yellow|" data-wrap-suf="}" title="Yellow text" style="background:#ffd43b"></button>
+      <button type="button" class="tb-dot" data-wrap-pre="{green|" data-wrap-suf="}" title="Green text" style="background:#69db7c"></button>
+      <button type="button" class="tb-dot" data-wrap-pre="{blue|" data-wrap-suf="}" title="Blue text" style="background:#74c0fc"></button>
+      <button type="button" class="tb-dot" data-wrap-pre="{purple|" data-wrap-suf="}" title="Purple text" style="background:#b197fc"></button>
+    </div>
+
+    <!-- Slash / Markdown Command Popup -->
+    <div id="cmdMenu" hidden></div>
+
+    <!-- Rich Visual Syntax Help -->
+    <div id="help" hidden>
+      <div class="help-title">Markdown &amp; Live Formatting</div>
+      <div class="help-grid">
+        <div class="help-row">
+          <span class="help-syntax"># Heading 1</span>
+          <span class="help-preview help-h1">Heading 1</span>
+        </div>
+        <div class="help-row">
+          <span class="help-syntax">## Heading 2</span>
+          <span class="help-preview help-h2">Heading 2</span>
+        </div>
+        <div class="help-row">
+          <span class="help-syntax">**bold** / *italic*</span>
+          <span class="help-preview"><strong>bold</strong> / <em>italic</em></span>
+        </div>
+        <div class="help-row">
+          <span class="help-syntax">~~strike~~ / `code`</span>
+          <span class="help-preview"><del>strike</del> / <span class="help-code-inline">code</span></span>
+        </div>
+        <div class="help-row">
+          <span class="help-syntax">- [ ] Task item</span>
+          <span class="help-preview">☑ Interactive checkbox</span>
+        </div>
+        <div class="help-row">
+          <span class="help-syntax">&gt; Quote block</span>
+          <span class="help-preview"><span class="help-quote">Quote block</span></span>
+        </div>
+        <div class="help-row">
+          <span class="help-syntax">==highlight==</span>
+          <span class="help-preview"><span class="help-mark">highlight</span></span>
+        </div>
+        <div class="help-row">
+          <span class="help-syntax">=={blue|colored}==</span>
+          <span class="help-preview"><span class="help-mark-blue">colored</span></span>
+        </div>
+        <div class="help-row">
+          <span class="help-syntax">{red|colored text}</span>
+          <span class="help-preview" style="color: #ff6b6b; font-weight: 500">colored text</span>
+        </div>
+        <div>
+          <span class="help-syntax">``` code block ```</span>
+          <div class="help-code-block">const notes = "live markdown";</div>
+        </div>
+        <div>
+          <div class="help-syntax" style="display: inline-block">Available {color|...} names:</div>
+          <div class="swatch-list">
+            <span style="color: #ff6b6b">red</span>
+            <span style="color: #ffa94d">orange</span>
+            <span style="color: #ffd43b">yellow</span>
+            <span style="color: #69db7c">green</span>
+            <span style="color: #38d9a9">teal</span>
+            <span style="color: #3bc9db">cyan</span>
+            <span style="color: #74c0fc">blue</span>
+            <span style="color: #b197fc">purple</span>
+            <span style="color: #f783ac">pink</span>
+            <span style="color: #868e96">gray</span>
+          </div>
+        </div>
+        <div class="help-row" style="margin-top: 0.25rem">
+          <span class="help-syntax">/subpage</span>
+          <span class="help-preview" style="color: var(--dim)">Embed nested subpage</span>
+        </div>
+        <div class="help-row">
+          <span class="help-syntax">Paste URL on line</span>
+          <span class="help-preview" style="color: var(--dim)">Auto image / video / card</span>
+        </div>
+      </div>
+    </div>
+
+    <button type="button" id="helpBtn" title="Markdown syntax" aria-label="Markdown syntax">?</button>
+  </body>
+</html><!DOCTYPE html>
+<html lang="en">
+  <head>
+    <title>Notes</title>
+    <meta charset="UTF-8" />
+    <meta name="author" content="Hizkia Felix - hizkifw.me" />
+    <meta
+      name="description"
       content="Dark theme Notion-like notes with live markdown and multi-page storage"
     />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
