@@ -1,0 +1,932 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <title>Notes</title>
+    <meta charset="UTF-8" />
+    <meta name="author" content="Hizkia Felix - hizkifw.me" />
+    <meta
+      name="description"
+      content="Dark theme notes with live markdown, saves to your browser storage"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      var lskeyDoc = 'doc';
+      var lskeyTime = 'doc-lastsave';
+
+      /* ------------------------------------------------------------------
+       * Tiny markdown renderer (no dependencies, works offline)
+       * ------------------------------------------------------------------ */
+
+      var PALETTE = {
+        red: '#ff6b6b',
+        orange: '#ffa94d',
+        yellow: '#ffd43b',
+        green: '#69db7c',
+        teal: '#38d9a9',
+        cyan: '#3bc9db',
+        blue: '#74c0fc',
+        purple: '#b197fc',
+        pink: '#f783ac',
+        gray: '#868e96',
+        grey: '#868e96',
+      };
+      var COLOR = '([a-zA-Z]+|#[0-9a-fA-F]{3,8})';
+
+      function colorOf(c) {
+        return PALETTE[c.toLowerCase()] || c;
+      }
+
+      function esc(s) {
+        return s
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;');
+      }
+
+      function safeUrl(u) {
+        return (
+          /^(https?:\/\/|mailto:|tel:|#|\/|\.\.?\/)/i.test(u) ||
+          !/^[a-z][a-z0-9+.\-]*:/i.test(u)
+        );
+      }
+
+      function inline(s) {
+        var st = [];
+        function keep(h) {
+          return '\u0001' + (st.push(h) - 1) + '\u0001';
+        }
+        s = s.replace(/[\u0000-\u0002]/g, '');
+
+        // `code`
+        s = s.replace(/`([^`]+)`/g, function (_, c) {
+          return keep('<code>' + esc(c) + '</code>');
+        });
+        s = esc(s);
+
+        // [label](url)
+        s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, function (m, t, u) {
+          if (!safeUrl(u)) return m;
+          if (/^www\./i.test(u)) u = 'https://' + u;
+          return (
+            keep('<a href="' + u + '" target="_blank" rel="noopener noreferrer">') +
+            t +
+            '\u0002'
+          );
+        });
+
+        // bare links
+        s = s.replace(/(^|[\s(])(https?:\/\/[^\s]+)/g, function (m, pre, u) {
+          var tail = (u.match(/[.,;:!?)]+$/) || [''])[0];
+          u = u.slice(0, u.length - tail.length);
+          return (
+            pre +
+            keep(
+              '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + u + '</a>'
+            ) +
+            tail
+          );
+        });
+
+        // emphasis
+        s = s
+          .replace(/\*\*\*(\S(?:.*?\S)?)\*\*\*/g, '<strong><em>$1</em></strong>')
+          .replace(/\*\*(\S(?:.*?\S)?)\*\*/g, '<strong>$1</strong>')
+          .replace(/__(\S(?:.*?\S)?)__/g, '<strong>$1</strong>')
+          .replace(/~~(\S(?:.*?\S)?)~~/g, '<del>$1</del>')
+          .replace(/\*(\S(?:.*?\S)?)\*/g, '<em>$1</em>')
+          .replace(/(^|[^\w])_(\S(?:.*?\S)?)_(?!\w)/g, '$1<em>$2</em>');
+
+        // =={color|text}== and ==text==
+        s = s
+          .replace(
+            new RegExp('==\\{' + COLOR + '\\|([^}]+)\\}==', 'g'),
+            function (_, c, t) {
+              return (
+                '<mark style="background:color-mix(in srgb, ' +
+                colorOf(c) +
+                ' 35%, transparent)">' +
+                t +
+                '</mark>'
+              );
+            }
+          )
+          .replace(/==(\S(?:.*?\S)?)==/g, '<mark>$1</mark>');
+
+        // {color|text}
+        s = s.replace(
+          new RegExp('\\{' + COLOR + '\\|([^}]+)\\}', 'g'),
+          function (_, c, t) {
+            return '<span style="color:' + colorOf(c) + '">' + t + '</span>';
+          }
+        );
+
+        return s
+          .replace(/\u0001(\d+)\u0001/g, function (_, n) {
+            return st[+n];
+          })
+          .replace(/\u0002/g, '</a>');
+      }
+
+      var RE_FENCE = /^\s*(```|~~~)/;
+      var RE_HEAD = /^(#{1,6})\s+(.*)$/;
+      var RE_HR = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/;
+      var RE_QUOTE = /^\s{0,3}>\s?(.*)$/;
+      var RE_LI = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
+
+      /* ------------------------------------------------------------------
+       * Live Notion-style Block Parsing & Rendering
+       * ------------------------------------------------------------------ */
+
+      // Splits raw markdown into logical blocks (single lines or fenced code blocks)
+      function parseBlocks(text) {
+        var lines = text.replace(/\r\n?/g, '\n').split('\n');
+        var blocks = [];
+        var i = 0;
+        while (i < lines.length) {
+          var m = lines[i].match(RE_FENCE);
+          if (m) {
+            var fence = m[1];
+            var startLine = i;
+            var buf = [lines[i++]];
+            while (i < lines.length) {
+              buf.push(lines[i]);
+              if (lines[i].trim().indexOf(fence) === 0) {
+                i++;
+                break;
+              }
+              i++;
+            }
+            blocks.push({ raw: buf.join('\n'), startLine: startLine, isFence: true });
+          } else {
+            blocks.push({ raw: lines[i], startLine: i, isFence: false });
+            i++;
+          }
+        }
+        return blocks;
+      }
+
+      // Renders a single block into its Notion-style visual HTML when not actively focused
+      function renderSingleBlock(block) {
+        var raw = block.raw;
+
+        if (block.isFence) {
+          var lines = raw.split('\n');
+          var inner = lines.slice(1);
+          if (inner.length && RE_FENCE.test(inner[inner.length - 1])) {
+            inner.pop();
+          }
+          return '<pre><code>' + (esc(inner.join('\n')) || '&nbsp;') + '</code></pre>';
+        }
+
+        if (/^\s*$/.test(raw)) {
+          return '<div class="md-empty"><br></div>';
+        }
+
+        var m;
+        if ((m = raw.match(RE_HEAD))) {
+          var lvl = m[1].length;
+          return (
+            '<h' + lvl + '>' + (inline(m[2].replace(/\s+#+\s*$/, '')) || '&nbsp;') + '</h' + lvl + '>'
+          );
+        }
+
+        if (RE_HR.test(raw)) {
+          return '<hr>';
+        }
+
+        if ((m = raw.match(RE_QUOTE))) {
+          return '<blockquote>' + (inline(m[1]) || '&nbsp;') + '</blockquote>';
+        }
+
+        if ((m = raw.match(RE_LI))) {
+          var indent = m[1].replace(/\t/g, '    ').length;
+          var pad = Math.floor(indent / 2) * 1.4;
+          var marker = m[2];
+          var content = m[3];
+          var task = content.match(/^\[( \vert{}x\vert{}X)\](?:\s+(.*))?$/);
+
+          if (task) {
+            var done = task[1] !== ' ';
+            return (
+              '<div class="md-li task' + (done ? ' done' : '') + '" style="padding-left:' + (1.6 + pad) + 'rem">' +
+              '<input type="checkbox" data-line="' + block.startLine + '"' + (done ? ' checked' : '') + '>' +
+              '<span>' + (inline(task[2] || '') || '&nbsp;') + '</span></div>'
+            );
+          }
+
+          var bullet = /\d/.test(marker) ? marker : '•';
+          return (
+            '<div class="md-li" style="padding-left:' + (1.6 + pad) + 'rem">' +
+            '<span class="md-bullet">' + esc(bullet) + '</span>' +
+            '<span>' + (inline(content) || '&nbsp;') + '</span></div>'
+          );
+        }
+
+        return '<p>' + inline(raw) + '</p>';
+      }
+
+      /* ------------------------------------------------------------------
+       * App
+       * ------------------------------------------------------------------ */
+
+      function init() {
+        if (!('localStorage' in window)) {
+          alert('Your browser does not support localStorage. Notes will not be saved.');
+        }
+
+        var editor = document.getElementById('editor');
+        var help = document.getElementById('help');
+
+        var rawText = localStorage.getItem(lskeyDoc) || '';
+        var lastSave = Number(localStorage.getItem(lskeyTime)) || Date.now();
+        var activeIdx = -1;
+
+        function save() {
+          lastSave = Date.now();
+          try {
+            localStorage.setItem(lskeyDoc, rawText);
+            localStorage.setItem(lskeyTime, lastSave);
+          } catch (e) {
+            console.error(e);
+          }
+        }
+
+        // Convert plain text safely into DOM nodes with <br> for newlines
+        function setPlainText(el, text) {
+          el.innerHTML = '';
+          if (!text) {
+            el.appendChild(document.createElement('br'));
+            return;
+          }
+          var parts = text.split('\n');
+          parts.forEach(function (part, idx) {
+            if (idx > 0) el.appendChild(document.createElement('br'));
+            if (part) el.appendChild(document.createTextNode(part));
+          });
+        }
+
+        // Extract plain text back from a contenteditable block
+        function getPlainText(el) {
+          var text = '';
+          el.childNodes.forEach(function (node) {
+            if (node.nodeType === 3) {
+              text += node.nodeValue;
+            } else if (node.nodeName === 'BR') {
+              text += '\n';
+            } else {
+              text += node.innerText || node.textContent || '';
+            }
+          });
+          // Remove trailing browser placeholder <br>
+          return text.replace(/\n$/, '');
+        }
+
+        // Get caret character offset inside an element
+        function getCaretOffset(el) {
+          var sel = window.getSelection();
+          if (!sel.rangeCount) return 0;
+          var range = sel.getRangeAt(0);
+          var pre = range.cloneRange();
+          pre.selectNodeContents(el);
+          pre.setEnd(range.endContainer, range.endOffset);
+          var div = document.createElement('div');
+          div.appendChild(pre.cloneContents());
+          return getPlainText(div).length;
+        }
+
+        // Restore caret character offset inside an element
+        function setCaretOffset(el, offset) {
+          var sel = window.getSelection();
+          var range = document.createRange();
+          var pos = 0;
+          var placed = false;
+
+          function walk(node) {
+            if (placed) return;
+            if (node.nodeType === 3) {
+              var len = node.nodeValue.length;
+              if (pos + len >= offset) {
+                range.setStart(node, Math.max(0, offset - pos));
+                range.collapse(true);
+                placed = true;
+              } else {
+                pos += len;
+              }
+            } else if (node.nodeName === 'BR') {
+              if (pos === offset) {
+                range.setStartBefore(node);
+                range.collapse(true);
+                placed = true;
+              }
+              pos += 1;
+            } else {
+              for (var i = 0; i < node.childNodes.length; i++) {
+                walk(node.childNodes[i]);
+              }
+            }
+          }
+
+          walk(el);
+          if (!placed) {
+            range.selectNodeContents(el);
+            range.collapse(false);
+          }
+          sel.removeAllRanges();
+          sel.addRange(range);
+        }
+
+        function syncFromDOM() {
+          var blockEls = editor.querySelectorAll('.block');
+          var lines = [];
+          blockEls.forEach(function (el, idx) {
+            if (idx === activeIdx) {
+              lines.push(getPlainText(el));
+            } else {
+              lines.push(el.dataset.raw);
+            }
+          });
+          rawText = lines.join('\n');
+          save();
+        }
+
+        function renderAll(focusIdx, caretPos) {
+          var blocks = parseBlocks(rawText);
+          if (blocks.length === 0) blocks = [{ raw: '', startLine: 0, isFence: false }];
+          activeIdx = focusIdx;
+
+          editor.innerHTML = '';
+          blocks.forEach(function (b, idx) {
+            var div = document.createElement('div');
+            div.className = 'block';
+            div.dataset.idx = idx;
+            div.dataset.raw = b.raw;
+
+            if (idx === activeIdx) {
+              div.classList.add('editing');
+              setPlainText(div, b.raw);
+            } else {
+              div.innerHTML = renderSingleBlock(b);
+            }
+            editor.appendChild(div);
+          });
+
+          if (activeIdx >= 0 && editor.children[activeIdx]) {
+            setCaretOffset(editor.children[activeIdx], caretPos != null ? caretPos : 0);
+          }
+        }
+
+        function activateBlock(idx, clickEvent) {
+          if (idx === activeIdx) return;
+          if (activeIdx >= 0) syncFromDOM();
+
+          var caretPos = null;
+          if (clickEvent && document.caretRangeFromPoint) {
+            var r = document.caretRangeFromPoint(clickEvent.clientX, clickEvent.clientY);
+            if (r) {
+              var clickedBlock = editor.children[idx];
+              if (clickedBlock && clickedBlock.contains(r.startContainer)) {
+                var pre = r.cloneRange();
+                pre.selectNodeContents(clickedBlock);
+                pre.setEnd(r.startContainer, r.startOffset);
+                caretPos = pre.toString().length;
+              }
+            }
+          }
+
+          renderAll(idx, caretPos);
+        }
+
+        // Initial render
+        renderAll(rawText ? -1 : 0, 0);
+
+        // Clicking a block activates raw markdown editing for just that block
+        editor.addEventListener('mousedown', function (e) {
+          // Allow clicking links directly
+          if (e.target.closest('a')) return;
+
+          // Handle interactive checkboxes without switching to raw mode
+          if (e.target.matches('input[type="checkbox"][data-line]')) {
+            e.preventDefault();
+            var ln = Number(e.target.dataset.line);
+            var lines = rawText.split('\n');
+            if (lines[ln] != null) {
+              lines[ln] = lines[ln].replace(
+                /^(\s*(?:[-*+]|\d+[.)])\s+)\[( \vert{}x\vert{}X)\]/,
+                function (_, pre, c) {
+                  return pre + (c === ' ' ? '[x]' : '[ ]');
+                }
+              );
+              rawText = lines.join('\n');
+              save();
+              renderAll(activeIdx, activeIdx >= 0 ? getCaretOffset(editor.children[activeIdx]) : 0);
+            }
+            return;
+          }
+
+          var blockEl = e.target.closest('.block');
+          if (blockEl) {
+            var idx = Number(blockEl.dataset.idx);
+            if (idx !== activeIdx) {
+              e.preventDefault();
+              editor.focus();
+              activateBlock(idx, e);
+            }
+          }
+        });
+
+        // Clicking empty space below the last block focuses/creates a block at the end
+        document.body.addEventListener('mousedown', function (e) {
+          if (e.target === document.body || e.target === editor) {
+            e.preventDefault();
+            editor.focus();
+            var blocks = parseBlocks(rawText);
+            var lastIdx = blocks.length - 1;
+            if (blocks[lastIdx].raw !== '') {
+              rawText += '\n';
+              lastIdx++;
+            }
+            renderAll(lastIdx, 0);
+          }
+        });
+
+        // Keep active block synchronized when navigating with arrow keys
+        document.addEventListener('selectionchange', function () {
+          if (document.activeElement !== editor) return;
+          var sel = window.getSelection();
+          if (!sel.rangeCount) return;
+          var node = sel.anchorNode;
+          var blockEl = node.nodeType === 1 ? node.closest('.block') : node.parentElement.closest('.block');
+          if (blockEl) {
+            var idx = Number(blockEl.dataset.idx);
+            if (idx !== activeIdx) {
+              var offset = getCaretOffset(blockEl);
+              syncFromDOM();
+              renderAll(idx, offset);
+            }
+          }
+        });
+
+        // Blur renders the active block cleanly
+        editor.addEventListener('blur', function () {
+          if (activeIdx >= 0) {
+            syncFromDOM();
+            renderAll(-1);
+          }
+        });
+
+        // Save on input
+        editor.addEventListener('input', function () {
+          if (activeIdx >= 0 && editor.children[activeIdx]) {
+            editor.children[activeIdx].dataset.raw = getPlainText(editor.children[activeIdx]);
+          }
+          syncFromDOM();
+        });
+
+        // Paste plain text cleanly
+        editor.addEventListener('paste', function (e) {
+          e.preventDefault();
+          var text = (e.clipboardData || window.clipboardData).getData('text/plain');
+          if (!text) return;
+          if (activeIdx < 0) return;
+
+          var el = editor.children[activeIdx];
+          var cur = getPlainText(el);
+          var offset = getCaretOffset(el);
+          var updated = cur.slice(0, offset) + text + cur.slice(offset);
+          el.dataset.raw = updated;
+          syncFromDOM();
+
+          var newBlocks = parseBlocks(rawText);
+          var targetIdx = Math.min(activeIdx + text.split('\n').length - 1, newBlocks.length - 1);
+          renderAll(targetIdx, newBlocks[targetIdx].raw.length);
+        });
+
+        // Editor keyboard shortcuts: Enter, Backspace merge, Tab indent, Escape
+        var RE_LISTLINE = /^(\s*)(?:([-*+])|(\d{1,9})([.)]))\s+([[ xX]]\s+)?(.*)$/;
+
+        editor.addEventListener('keydown', function (e) {
+          if (e.key === 'Escape') {
+            help.hidden = true;
+            return;
+          }
+
+          if (activeIdx < 0 || !editor.children[activeIdx]) return;
+          var el = editor.children[activeIdx];
+          var v = getPlainText(el);
+          var offset = getCaretOffset(el);
+          var isFenceBlock = RE_FENCE.test(v);
+
+          // Tab / Shift+Tab indentation
+          if (e.key === 'Tab' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+            e.preventDefault();
+            var lineStart = v.lastIndexOf('\n', offset - 1) + 1;
+            if (e.shiftKey) {
+              var before = v.slice(lineStart);
+              var trimmed = before.replace(/^( {1,2}|\t)/, '');
+              var diff = before.length - trimmed.length;
+              var next = v.slice(0, lineStart) + trimmed;
+              setPlainText(el, next);
+              setCaretOffset(el, Math.max(lineStart, offset - diff));
+            } else {
+              var next = v.slice(0, offset) + '  ' + v.slice(offset);
+              setPlainText(el, next);
+              setCaretOffset(el, offset + 2);
+            }
+            el.dataset.raw = getPlainText(el);
+            syncFromDOM();
+            return;
+          }
+
+          // Enter splits into a new block (unless inside an unclosed ``` fence or Shift+Enter)
+          if (e.key === 'Enter' && !e.isComposing) {
+            var fenceLines = v.split('\n');
+            var unclosedFence =
+              isFenceBlock &&
+              (fenceLines.length === 1 || !RE_FENCE.test(fenceLines[fenceLines.length - 1]));
+
+            if (unclosedFence || e.shiftKey) {
+              e.preventDefault();
+              var next = v.slice(0, offset) + '\n' + v.slice(offset);
+              setPlainText(el, next);
+              setCaretOffset(el, offset + 1);
+              el.dataset.raw = getPlainText(el);
+              syncFromDOM();
+              return;
+            }
+
+            e.preventDefault();
+            var before = v.slice(0, offset);
+            var after = v.slice(offset);
+
+            // Auto-continue lists
+            var m = before.match(RE_LISTLINE);
+            if (m && after === '') {
+              if (m[6] === '') {
+                // Empty list item: Enter exits the list
+                el.dataset.raw = '';
+                syncFromDOM();
+                renderAll(activeIdx, 0);
+                return;
+              }
+              var marker = m[2] || parseInt(m[3], 10) + 1 + m[4];
+              var prefix = m[1] + marker + ' ' + (m[5] ? '[ ] ' : '');
+              el.dataset.raw = before;
+              syncFromDOM();
+
+              var lines = rawText.split('\n');
+              var blocks = parseBlocks(rawText);
+              var insertLine = blocks[activeIdx].startLine + blocks[activeIdx].raw.split('\n').length;
+              lines.splice(insertLine, 0, prefix);
+              rawText = lines.join('\n');
+              save();
+              renderAll(activeIdx + 1, prefix.length);
+              return;
+            }
+
+            el.dataset.raw = before + '\n' + after;
+            syncFromDOM();
+            renderAll(activeIdx + 1, 0);
+            return;
+          }
+
+          // Backspace at start of block merges with previous block
+          if (e.key === 'Backspace' && offset === 0 && activeIdx > 0) {
+            var sel = window.getSelection();
+            if (sel.isCollapsed) {
+              e.preventDefault();
+              var blocks = parseBlocks(rawText);
+              var prevRaw = blocks[activeIdx - 1].raw;
+              var curRaw = v;
+              var joinPos = prevRaw.length;
+
+              blocks[activeIdx - 1].raw = prevRaw + curRaw;
+              blocks.splice(activeIdx, 1);
+              rawText = blocks.map(function (b) { return b.raw; }).join('\n');
+              save();
+              renderAll(activeIdx - 1, joinPos);
+            }
+          }
+        });
+
+        // Cross-tab sync
+        function reloadDoc() {
+          var lsTime = Number(localStorage.getItem(lskeyTime));
+          if (lsTime > lastSave) {
+            lastSave = lsTime;
+            rawText = localStorage.getItem(lskeyDoc) || '';
+            renderAll(-1);
+          }
+        }
+        setInterval(reloadDoc, 1000);
+
+        // Help toggle
+        document.getElementById('helpBtn').addEventListener('click', function (e) {
+          e.stopPropagation();
+          help.hidden = !help.hidden;
+        });
+
+        document.addEventListener('keydown', function (e) {
+          if (e.key === 'Escape') help.hidden = true;
+        });
+
+        // Register service worker for offline usage
+        if ('serviceWorker' in navigator) {
+          navigator.serviceWorker.register('./sw.js').catch(function (e) {
+            console.error(e);
+          });
+        }
+      }
+    </script>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #111;
+        --fg: #fff;
+        --text: #e6e6e6;
+        --dim: #737373;
+        --line: #262626;
+        --raise: #1a1a1a;
+        --accent: #74c0fc;
+        --font-edit: Menlo, Consolas, Monaco, Liberation Mono, Lucida Console, monospace;
+        --font-view: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        background-color: var(--bg);
+        color: var(--text);
+        font-family: var(--font-view);
+        overflow-y: auto;
+      }
+
+      /* Centered Notion-like canvas */
+      #editor {
+        max-width: 740px;
+        min-height: 100vh;
+        margin: 0 auto;
+        padding: 3.5rem 1.75rem 8rem;
+        font-size: 1.08rem;
+        line-height: 1.65;
+        outline: none;
+        cursor: text;
+      }
+
+      #editor:empty::before {
+        content: 'Start typing...';
+        color: var(--dim);
+        pointer-events: none;
+      }
+
+      .block {
+        min-height: 1.65em;
+        border-radius: 4px;
+        word-wrap: break-word;
+      }
+
+      /* Active block shows clean monospace markdown syntax */
+      .block.editing {
+        font-family: var(--font-edit);
+        font-size: 0.98rem;
+        color: var(--fg);
+        background: rgba(255, 255, 255, 0.03);
+        padding: 0.1rem 0.35rem;
+        margin: 0 -0.35rem;
+        white-space: pre-wrap;
+      }
+
+      /* Rendered block typography */
+      .block p {
+        margin: 0.25em 0;
+      }
+      .md-empty {
+        height: 1.1em;
+      }
+      .block h1,
+      .block h2,
+      .block h3,
+      .block h4,
+      .block h5,
+      .block h6 {
+        color: var(--fg);
+        line-height: 1.25;
+        margin: 0.9em 0 0.25em;
+        font-weight: 650;
+      }
+      .block:first-child h1,
+      .block:first-child h2,
+      .block:first-child h3 {
+        margin-top: 0;
+      }
+      .block h1 {
+        font-size: 1.9em;
+        padding-bottom: 0.2em;
+        border-bottom: 1px solid var(--line);
+      }
+      .block h2 {
+        font-size: 1.5em;
+        padding-bottom: 0.2em;
+        border-bottom: 1px solid var(--line);
+      }
+      .block h3 {
+        font-size: 1.25em;
+      }
+      .block h4 {
+        font-size: 1.1em;
+      }
+      .block h5,
+      .block h6 {
+        font-size: 1em;
+        color: var(--dim);
+      }
+
+      .block hr {
+        border: 0;
+        border-top: 1px solid #2e2e2e;
+        margin: 1.1rem 0;
+      }
+
+      .block a {
+        color: var(--accent);
+        text-decoration: underline;
+        text-decoration-color: #74c0fc55;
+        text-underline-offset: 0.15em;
+      }
+      .block a:hover {
+        text-decoration-color: var(--accent);
+      }
+
+      .block code,
+      .block pre {
+        font-family: var(--font-edit);
+      }
+      .block code {
+        background: var(--raise);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 0.08em 0.35em;
+        font-size: 0.86em;
+      }
+      .block pre {
+        background: var(--raise);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 0.8rem 1rem;
+        overflow-x: auto;
+        line-height: 1.5;
+        margin: 0.5em 0;
+      }
+      .block pre code {
+        background: none;
+        border: 0;
+        padding: 0;
+        font-size: 0.92rem;
+      }
+
+      .block blockquote {
+        margin: 0.35em 0;
+        padding: 0.1rem 1rem;
+        border-left: 3px solid #3a3a3a;
+        color: #a8a8a8;
+      }
+
+      .block mark {
+        background: rgba(255, 212, 59, 0.3);
+        color: inherit;
+        border-radius: 3px;
+        padding: 0.05em 0.2em;
+      }
+      .block del {
+        color: var(--dim);
+      }
+
+      /* Lists & Checklists */
+      .md-li {
+        position: relative;
+        margin: 0.18em 0;
+      }
+      .md-bullet {
+        position: absolute;
+        left: 0.45rem;
+        color: var(--dim);
+        user-select: none;
+      }
+      .md-li.task.done > span {
+        color: var(--dim);
+        text-decoration: line-through;
+      }
+      .md-li input[type='checkbox'] {
+        -webkit-appearance: none;
+        appearance: none;
+        position: absolute;
+        left: 0.25rem;
+        top: 0.36em;
+        width: 1em;
+        height: 1em;
+        margin: 0;
+        border: 1.5px solid #555;
+        border-radius: 4px;
+        background: transparent;
+        cursor: pointer;
+      }
+      .md-li input[type='checkbox']:hover {
+        border-color: var(--accent);
+      }
+      .md-li input[type='checkbox']:checked {
+        background: var(--accent);
+        border-color: var(--accent);
+      }
+      .md-li input[type='checkbox']:checked::after {
+        content: '';
+        display: block;
+        width: 0.28em;
+        height: 0.52em;
+        border: solid var(--bg);
+        border-width: 0 2px 2px 0;
+        transform: translate(0.27em, 0.02em) rotate(45deg);
+      }
+
+      /* Minimal floating help trigger */
+      #helpBtn {
+        position: fixed;
+        right: 1.25rem;
+        bottom: 1.25rem;
+        width: 28px;
+        height: 28px;
+        border-radius: 50%;
+        border: 1px solid var(--line);
+        background: var(--raise);
+        color: var(--dim);
+        font: 500 13px/1 var(--font-view);
+        display: grid;
+        place-items: center;
+        cursor: pointer;
+        transition: color 0.15s, border-color 0.15s, background 0.15s;
+      }
+      #helpBtn:hover,
+      #helpBtn:focus-visible {
+        color: var(--fg);
+        border-color: #444;
+        background: #222;
+        outline: none;
+      }
+
+      #help {
+        position: fixed;
+        right: 1.25rem;
+        bottom: 3.5rem;
+        max-width: calc(100vw - 2.5rem);
+        background: var(--raise);
+        border: 1px solid #303030;
+        border-radius: 8px;
+        padding: 0.85rem 1.1rem;
+        font-size: 12px;
+        line-height: 1.65;
+        color: #bbb;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+      }
+      #help[hidden] {
+        display: none;
+      }
+      #help pre {
+        margin: 0;
+        font-family: var(--font-edit);
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+
+  <body onload="init()">
+    <main id="editor" contenteditable="true" spellcheck="true"></main>
+
+    <div id="help" hidden>
+      <pre>
+# Heading   (# up to ######)
+**bold**  *italic*  ~~strike~~  `code`
+- bullet    1. numbered    - [ ] task
+&gt; quote      ---  divider
+```
+code block
+```
+{red|colored text}   {#ff8800|any hex}
+==highlight==   =={blue|colored highlight}==
+[label](https://example.com)
+
+colors: red orange yellow green teal
+        cyan blue purple pink gray
+
+Tab / Shift+Tab   indent
+Shift + Enter     newline inside block</pre>
+    </div>
+
+    <button type="button" id="helpBtn" title="Markdown syntax" aria-label="Markdown syntax">?</button>
+  </body>
+</html>
